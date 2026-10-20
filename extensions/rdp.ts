@@ -18,7 +18,17 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
-const BRIDGE_SCRIPT = join(EXTENSION_DIR, "..", "bridge", "rdp_bridge.py");
+const BRIDGE_DIR = join(EXTENSION_DIR, "..", "bridge");
+
+/** Python packages each bridge needs; `uv run --with` installs them on the fly. */
+const BRIDGE_DEPS: Record<string, string[]> = {
+	rdp: ["aardwolf", "pillow"],
+	vnc: ["pillow", "pycryptodomex"],
+};
+
+function bridgeScript(protocol: string): string {
+	return join(BRIDGE_DIR, protocol === "vnc" ? "vnc_bridge.py" : "rdp_bridge.py");
+}
 const CONFIG_PATH = join(homedir(), ".config", "pi-rdp-computer-use", "config.json");
 const DEFAULT_TIMEOUT_MS = 60_000;
 const CONNECT_TIMEOUT_MS = 120_000;
@@ -28,6 +38,8 @@ const CONSENT_DECLINED =
 	"The user did not grant consent (declined or no answer within 3 minutes). Nothing was sent to the desktop.";
 
 interface RdpConfig {
+	/** "rdp" (default) or "vnc". Both expose the same tools. */
+	protocol?: "rdp" | "vnc";
 	host?: string;
 	port?: number;
 	username?: string;
@@ -63,6 +75,7 @@ function loadConfig(): RdpConfig {
 		}
 	}
 	const env = process.env;
+	if (env.PI_RDP_PROTOCOL === "rdp" || env.PI_RDP_PROTOCOL === "vnc") config.protocol = env.PI_RDP_PROTOCOL;
 	if (env.RDP_HOST) config.host = env.RDP_HOST;
 	if (env.RDP_PORT) config.port = Number(env.RDP_PORT);
 	if (env.RDP_USERNAME) config.username = env.RDP_USERNAME;
@@ -85,6 +98,21 @@ class Bridge {
 		this.config = config;
 	}
 
+	get protocol(): "rdp" | "vnc" {
+		return this.config.protocol === "vnc" ? "vnc" : "rdp";
+	}
+
+	get script(): string {
+		return bridgeScript(this.protocol);
+	}
+
+	/** Drop the process so the next call re-reads the config (protocol switch). */
+	restart(): void {
+		this.child?.kill();
+		this.child = undefined;
+		this.buffer = "";
+	}
+
 	get running(): boolean {
 		return this.child !== undefined && !this.child.killed;
 	}
@@ -95,28 +123,17 @@ class Bridge {
 
 	private start(): void {
 		if (this.running) return;
-		if (!existsSync(BRIDGE_SCRIPT)) {
-			throw new Error(`Bridge script missing: ${BRIDGE_SCRIPT}`);
+		const script = this.script;
+		if (!existsSync(script)) {
+			throw new Error(`Bridge script missing: ${script}`);
 		}
 
 		const explicitPython = this.config.python ?? process.env.PI_RDP_PYTHON;
 		const command = explicitPython ?? "uv";
+		const withArgs = (BRIDGE_DEPS[this.protocol] ?? []).flatMap((dep) => ["--with", dep]);
 		const args = explicitPython
-			? [BRIDGE_SCRIPT]
-			: [
-					"run",
-					"--quiet",
-					"--python",
-					"3.13",
-					"--with",
-					"aardwolf",
-					"--with",
-					"pillow",
-					"--no-project",
-					"--",
-					"python",
-					BRIDGE_SCRIPT,
-				];
+			? [script]
+			: ["run", "--quiet", "--python", "3.13", ...withArgs, "--no-project", "--", "python", script];
 
 		const child = spawn(command, args, {
 			stdio: ["pipe", "pipe", "pipe"],
@@ -135,7 +152,7 @@ class Bridge {
 		child.on("exit", (code) => {
 			this.child = undefined;
 			const reason = new Error(
-				`RDP bridge exited (code ${code ?? "null"}).${this.recentStderr() ? `\n${this.recentStderr()}` : ""}`,
+				`Desktop bridge exited (code ${code ?? "null"}).${this.recentStderr() ? `\n${this.recentStderr()}` : ""}`,
 			);
 			for (const [, entry] of this.pending) entry.reject(reason);
 			this.pending.clear();
@@ -231,7 +248,7 @@ function screenshotContent(result: Record<string, unknown>) {
 }
 
 export default function rdpComputerUse(pi: ExtensionAPI) {
-	let config = loadConfig();
+	const config: RdpConfig = loadConfig();
 	const bridge = new Bridge(config);
 
 	pi.on("session_shutdown", () => {
@@ -296,19 +313,20 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 				`No RDP host configured. Pass host, set RDP_HOST, or create ${CONFIG_PATH} with {"host","username","password"}.`,
 			);
 		}
-		return { host, port: params.port ?? config.port ?? 3389 };
+		const protocol = config.protocol === "vnc" ? "vnc" : "rdp";
+	return { host, port: params.port ?? config.port ?? (protocol === "vnc" ? 5900 : 3389) };
 	};
 
 	pi.registerTool({
 		name: "rdp_connect",
 		label: "RDP Connect",
 		description:
-			"Open (or re-open) an RDP session to a desktop and wait for the first frame. Credentials come from parameters, RDP_USERNAME/RDP_PASSWORD, or the config file.",
-		promptSnippet: "Connect to a remote desktop over RDP before taking screenshots or sending input",
+			"Open (or re-open) a desktop session (RDP or VNC, whichever the config selects) and wait for the first frame. Credentials come from parameters, RDP_USERNAME/RDP_PASSWORD, or the config file.",
+		promptSnippet: "Connect to the desktop over RDP or VNC before taking screenshots or sending input",
 		parameters: Type.Object({
-			host: Type.Optional(Type.String({ description: "RDP server host, e.g. 192.168.1.20 or localhost" })),
-			port: Type.Optional(Type.Number({ description: "RDP port (default 3389)" })),
-			username: Type.Optional(Type.String({ description: "Account name on the remote desktop" })),
+			host: Type.Optional(Type.String({ description: "Desktop server host, e.g. 192.168.1.20 or localhost" })),
+			port: Type.Optional(Type.Number({ description: "Server port (default 3389 for RDP, 5900 for VNC)" })),
+			username: Type.Optional(Type.String({ description: "Account name on the remote desktop (RDP only)" })),
 			password: Type.Optional(Type.String({ description: "Account password" })),
 			domain: Type.Optional(Type.String({ description: "Optional NTLM domain" })),
 			width: Type.Optional(Type.Number({ description: "Requested desktop width (default 1920)" })),
@@ -316,20 +334,25 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 		}),
 		executionMode: "sequential",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			await gate(ctx, "actions", "Allow remote desktop control?", `Pi wants to open an RDP session.`);
-			config = loadConfig();
+			Object.assign(config, loadConfig());
+			const protocol = config.protocol === "vnc" ? "vnc" : "rdp";
+			await gate(ctx, "actions", "Allow remote desktop control?", `Pi wants to open a ${protocol.toUpperCase()} session.`);
+			// Restart so a changed protocol/python setting takes effect.
+			bridge.restart();
 			const target = resolveTarget(params);
 			const username = params.username ?? config.username;
 			const password = params.password ?? config.password;
-			if (!username) throw new Error("Missing RDP username (parameter, RDP_USERNAME, or config file).");
-			if (password === undefined) throw new Error("Missing RDP password (parameter, RDP_PASSWORD, or config file).");
+			if (protocol === "rdp" && !username) {
+				throw new Error("Missing RDP username (parameter, RDP_USERNAME, or config file).");
+			}
+			if (password === undefined) throw new Error("Missing desktop password (parameter, RDP_PASSWORD, or config file).");
 
 			const result = await bridge.call(
 				"connect",
 				{
 					host: target.host,
 					port: target.port,
-					username,
+					username: username ?? "",
 					password,
 					domain: params.domain ?? config.domain,
 					width: params.width ?? config.width,
@@ -340,7 +363,8 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 			return {
 				content: [
 					text(
-						`Connected to ${target.host}:${target.port} as ${username}${result.frame_ready ? " (first frame received)" : ""}.`,
+						`Connected to ${target.host}:${target.port} over ${protocol.toUpperCase()}` +
+							`${username ? ` as ${username}` : ""}${result.frame_ready ? " (first frame received)" : ""}.`,
 					),
 				],
 				details: { ...result, password: undefined },

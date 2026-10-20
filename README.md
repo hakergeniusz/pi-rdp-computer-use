@@ -1,8 +1,15 @@
 # pi-rdp-computer-use
 
-Computer use over **RDP** for [Pi](https://pi.dev): the agent sees a remote desktop as images and drives it with mouse and keyboard events.
+Computer use over **RDP or VNC** for [Pi](https://pi.dev): the agent sees a remote desktop as images and drives it with mouse and keyboard events.
 
-Built for Wayland desktops, where X11 automation tools (`xdotool`), screen grabbers (`scrot`/`import`) and input injectors (`ydotool`, `uinput`) are unavailable or need root. This extension needs none of them: it speaks the RDP protocol directly.
+Built for Wayland desktops, where X11 automation tools (`xdotool`), screen grabbers (`scrot`/`import`) and input injectors (`ydotool`, `uinput`) are unavailable or need root. This extension needs none of them: it speaks the remote desktop protocol directly.
+
+Two transports, identical tools:
+
+| Protocol | Bridge | Use when |
+| --- | --- | --- |
+| `rdp` (default) | `bridge/rdp_bridge.py` (aardwolf) | Windows, `xrdp`, any NLA-capable server |
+| `vnc` | `bridge/vnc_bridge.py` (own RFB 3.8 client) | GNOME Remote Desktop, `x11vnc`, wayvnc, TigerVNC — and when RDP auth is broken server-side |
 
 ## How it works
 
@@ -10,9 +17,9 @@ Built for Wayland desktops, where X11 automation tools (`xdotool`), screen grabb
 Pi extension (extensions/rdp.ts)
         │  newline-delimited JSON over stdio
         ▼
-Python bridge (bridge/rdp_bridge.py)  ── aardwolf RDP client ──▶  RDP server
+Python bridge (bridge/*.py)  ── RDP (aardwolf) or RFB 3.8 ──▶  desktop server
         │                                   ▲
-        │  bitmap updates → PNG             │  fastpath input events
+        │  bitmap updates → PNG             │  input events
         ▼                                   │
    model sees an image                 click / type / scroll / drag
 ```
@@ -26,7 +33,7 @@ Python bridge (bridge/rdp_bridge.py)  ── aardwolf RDP client ──▶  RDP 
 
 * Pi with extension support
 * `uv` (runs the Python bridge; dependencies are installed on demand)
-* An RDP server that accepts your credentials (Windows RDP, `xrdp`, GNOME Remote Desktop, ...)
+* A desktop server that accepts your credentials: RDP (Windows, `xrdp`, GNOME Remote Desktop) or VNC (GNOME Remote Desktop, `x11vnc`, wayvnc, TigerVNC)
 
 ## Install
 
@@ -46,9 +53,10 @@ Credentials are resolved in this order: tool parameter → environment variable 
 
 | Setting | Environment | Config file |
 | --- | --- | --- |
+| protocol | `PI_RDP_PROTOCOL` | `protocol` (`rdp` or `vnc`) |
 | host | `RDP_HOST` | `host` |
-| port | `RDP_PORT` | `port` (default `3389`) |
-| username | `RDP_USERNAME` | `username` |
+| port | `RDP_PORT` | `port` (default `3389` RDP, `5900` VNC) |
+| username | `RDP_USERNAME` | `username` (RDP only) |
 | password | `RDP_PASSWORD` | `password` |
 | domain | `RDP_DOMAIN` | `domain` |
 | geometry | – | `width`, `height` |
@@ -60,11 +68,11 @@ Config file: `~/.config/pi-rdp-computer-use/config.json`
 
 ```json
 {
-  "host": "192.168.1.20",
-  "port": 3389,
-  "username": "hakergeniusz",
-  "width": 1920,
-  "height": 1080
+  "protocol": "vnc",
+  "host": "127.0.0.1",
+  "port": 5900,
+  "password": "••••••••",
+  "consent": { "actions": true, "timeoutMs": 180000 }
 }
 ```
 
@@ -77,6 +85,38 @@ uv venv ~/.local/share/pi-rdp
 uv pip install --python ~/.local/share/pi-rdp/bin/python aardwolf pillow
 export PI_RDP_PYTHON=~/.local/share/pi-rdp/bin/python
 ```
+
+## VNC backend (GNOME Remote Desktop)
+
+GNOME Remote Desktop's VNC backend is the reliable path on Wayland: it shares the
+live session, and its password authentication has none of the NLA machinery that
+RDP uses. Three settings decide whether it works at all:
+
+```bash
+# 1. password auth instead of the default desktop prompt
+#    (with "prompt" the server sends no RFB banner and every client just times out)
+gsettings set org.gnome.desktop.remote-desktop.vnc auth-method password
+
+# 2. allow input, not just viewing (the default is view-only)
+gsettings set org.gnome.desktop.remote-desktop.vnc view-only false
+
+# 3. an 8-character password (RFB truncates to 8) and enable the backend
+grdctl vnc set-password 'Secret12'
+grdctl vnc enable
+systemctl --user restart gnome-remote-desktop.service
+```
+
+Then point the extension at it:
+
+```json
+{ "protocol": "vnc", "host": "127.0.0.1", "port": 5900, "password": "Secret12" }
+```
+
+Notes:
+
+* The VNC backend shares the **live, unlocked** session. If the screen is locked the agent sees the lock screen; it cannot unlock it.
+* Screen contents can change under the agent while you work — expect frames to differ from what it saw a moment earlier.
+* Disable it again with `grdctl vnc disable` and `gsettings set org.gnome.desktop.remote-desktop.vnc enable false`.
 
 ## Consent
 
@@ -131,7 +171,7 @@ rdp_key(key="ctrl+s")
 
 ## Troubleshooting
 
-Run `/rdp doctor` first: it reports the Python and `aardwolf` versions, the session type, and whether any local display is involved (never).
+Run `/rdp doctor` first: it reports the Python and library versions, the protocol in use, the negotiated encodings, and whether any local display is involved (never).
 
 **`STATUS_LOGON_FAILURE` (0xc000006d) or `SEC_E_LOGON_DENIED`**
 The server refused the credentials during NLA/CredSSP. Check the username and password first. If you run GNOME Remote Desktop, re-set the RDP credentials and restart the daemon:
@@ -144,11 +184,26 @@ systemctl --user restart gnome-remote-desktop.service
 Note that `grdctl rdp set-credentials <user> --password` with piped stdin can store a mangled value; the daemon then keeps rejecting a password that looks correct.
 
 **Input is ignored though screenshots update**
-The server is in view-only mode. GNOME Remote Desktop exposes this as:
+The server is in view-only mode. For RDP:
 
 ```bash
 grdctl rdp disable-view-only
 ```
+
+For VNC the same concept lives in dconf, and it is **on by default**:
+
+```bash
+gsettings set org.gnome.desktop.remote-desktop.vnc view-only false
+```
+
+**VNC: the connection hangs with no banner at all**
+`auth-method` is still `prompt`, so the server waits for someone to approve a dialog on the desktop before speaking RFB. Set `auth-method password` (see [VNC backend](#vnc-backend-gnome-remote-desktop)).
+
+**VNC: `VNC authentication failed`**
+RFB only uses the first 8 characters of the password, and `grdctl vnc set-password` stores exactly what you give it. Keep client and server strings identical in those 8 characters, then restart the daemon.
+
+**VNC: screen stops updating**
+The bridge only negotiates RAW and CopyRect. If a server insists on another encoding it raises `unsupported encoding` in `/rdp status` (`last_error`); reconnect. aardwolf's own VNC client is not used because its RRE path raises, its pointer masks never set a button, and its wheel maps to button 0.
 
 **Server requires NLA**
 Already handled: the bridge offers NTLM inside CredSSP. Kerberos-first clients (`xfreerdp3`) can fail on hosts whose `/etc/krb5.conf` has a default realm, which is why this bridge pins NTLM.
@@ -157,7 +212,10 @@ Already handled: the bridge offers NTLM inside CredSSP. Kerberos-first clients (
 The server has not painted yet. `rdp_screenshot` waits for the first frame (set `allow_blank` to skip that wait, or lower `first_frame_timeout`).
 
 **Slow first call**
-The first tool call pays for `uv`'s resolve/install of `aardwolf`. Set `PI_RDP_PYTHON` to a prepared virtualenv to remove that.
+The first tool call pays for `uv`'s resolve/install of the bridge dependencies (`aardwolf`+`pillow` for RDP, `pillow`+`pycryptodomex` for VNC). Set `PI_RDP_PYTHON` to a prepared virtualenv to remove that.
+
+**The agent's keystrokes land in whatever is focused on the real desktop**
+That is the point of computer use, but it also means a stray `escape` or `ctrl+w` hits your own windows (including the terminal running Pi). Keep the consent prompt enabled and only approve actions you want on that screen.
 
 ## Security
 
@@ -165,7 +223,8 @@ The first tool call pays for `uv`'s resolve/install of `aardwolf`. Set `PI_RDP_P
 * The session runs with your user's privileges and a live remote-control channel to the target desktop.
 * Nothing is written to disk except screenshots you request through `/rdp shot`.
 * The bridge talks only to the configured host and port; there is no telemetry.
-* Treat the RDP password like any other secret: prefer the environment variable, and rotate it if it has been shared in plain text.
+* Treat the desktop password like any other secret: prefer the environment variable or a `chmod 600` config, and rotate it if it has been shared in plain text.
+* VNC password authentication is DES-based, limited to 8 characters, and sends the challenge/response **without TLS**. Only enable the VNC backend on a host/network you trust; for RDP the bridge keeps NLA (with TLS inside CredSSP).
 
 ## License
 

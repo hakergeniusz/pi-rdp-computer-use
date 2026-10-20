@@ -1,6 +1,6 @@
 {
 	"name": "pi-rdp-computer-use",
-	"version": "0.2.0",
+	"version": "0.3.0",
 	"description": "Computer use over RDP for Pi: headless screenshots and mouse/keyboard control that work on Wayland",
 	"type": "module",
 	"license": "MIT",
