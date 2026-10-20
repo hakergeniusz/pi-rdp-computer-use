@@ -54,6 +54,7 @@ Credentials are resolved in this order: tool parameter → environment variable 
 | geometry | – | `width`, `height` |
 | screenshot cap | – | `maxScreenshotWidth` |
 | python | `PI_RDP_PYTHON` | `python` |
+| consent | – | `consent.actions`, `consent.screenshots`, `consent.timeoutMs` |
 
 Config file: `~/.config/pi-rdp-computer-use/config.json`
 
@@ -76,6 +77,29 @@ uv venv ~/.local/share/pi-rdp
 uv pip install --python ~/.local/share/pi-rdp/bin/python aardwolf pillow
 export PI_RDP_PYTHON=~/.local/share/pi-rdp/bin/python
 ```
+
+## Consent
+
+Every tool that changes your desktop asks first, and the prompt **auto-declines after 3 minutes** of no answer — a forgotten dialog can never turn into unattended remote control.
+
+| Tool | Asks by default |
+| --- | --- |
+| `rdp_connect`, `rdp_click`, `rdp_move`, `rdp_drag`, `rdp_scroll`, `rdp_type`, `rdp_key` | yes |
+| `rdp_screenshot`, `rdp_status`, `rdp_disconnect` | no (read-only) |
+
+On a decline or a timeout the tool sends nothing and returns `The user did not grant consent (declined or no answer within 3 minutes)` so the model knows control was withheld.
+
+```json
+{
+  "consent": {
+    "actions": true,
+    "screenshots": false,
+    "timeoutMs": 180000
+  }
+}
+```
+
+Set `consent.actions` to `false` only if you want the model to drive the desktop without prompts. Screenshots are not gated by default because they are non-destructive; set `consent.screenshots` to `true` to be asked before each capture.
 
 ## Tools
 
@@ -137,6 +161,7 @@ The first tool call pays for `uv`'s resolve/install of `aardwolf`. Set `PI_RDP_P
 
 ## Security
 
+* Every input tool is consent-gated with a 3-minute auto-decline (see [Consent](#consent)).
 * The session runs with your user's privileges and a live remote-control channel to the target desktop.
 * Nothing is written to disk except screenshots you request through `/rdp shot`.
 * The bridge talks only to the configured host and port; there is no telemetry.

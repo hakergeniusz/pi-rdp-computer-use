@@ -22,6 +22,10 @@ const BRIDGE_SCRIPT = join(EXTENSION_DIR, "..", "bridge", "rdp_bridge.py");
 const CONFIG_PATH = join(homedir(), ".config", "pi-rdp-computer-use", "config.json");
 const DEFAULT_TIMEOUT_MS = 60_000;
 const CONNECT_TIMEOUT_MS = 120_000;
+/** Ask the user for a decision for this long, then treat silence as a refusal. */
+const CONSENT_TIMEOUT_MS = 180_000;
+const CONSENT_DECLINED =
+	"The user did not grant consent (declined or no answer within 3 minutes). Nothing was sent to the desktop.";
 
 interface RdpConfig {
 	host?: string;
@@ -34,6 +38,12 @@ interface RdpConfig {
 	/** Python used to run the bridge. Defaults to `uv run --with aardwolf`. */
 	python?: string;
 	maxScreenshotWidth?: number;
+	/** Ask the user before acting on their desktop. Default: actions gated, screenshots not. */
+	consent?: {
+		actions?: boolean;
+		screenshots?: boolean;
+		timeoutMs?: number;
+	};
 }
 
 interface BridgeResponse {
@@ -228,6 +238,57 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 		bridge.stop();
 	});
 
+	type ConsentUi = {
+		ui: {
+			confirm: (
+				title: string,
+				message: string,
+				opts?: { timeout?: number; signal?: AbortSignal },
+			) => Promise<boolean>;
+		};
+	};
+
+	/**
+	 * Ask the user before touching their desktop.
+	 *
+	 * Mirrors pi-ask-user-question: a dialog with a live countdown closes after
+	 * CONSENT_TIMEOUT_MS, and an unanswered prompt counts as a refusal, so a
+	 * forgotten prompt can never turn into unattended remote control.
+	 *
+	 * The dialog timeout is the primary mechanism; the AbortSignal timer is a
+	 * backstop for any UI that does not honour it, so the gate always resolves.
+	 */
+	const requireConsent = async (ctx: ConsentUi, title: string, detail: string): Promise<void> => {
+		const timeout = config.consent?.timeoutMs ?? CONSENT_TIMEOUT_MS;
+		const controller = new AbortController();
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const expired = new Promise<boolean>((resolve) => {
+			timer = setTimeout(() => {
+				controller.abort();
+				resolve(false);
+			}, timeout);
+		});
+		let granted = false;
+		try {
+			granted = await Promise.race([
+				ctx.ui.confirm(title, `${detail}\n\nAuto-declines in ${Math.round(timeout / 1000)}s.`, {
+					timeout,
+					signal: controller.signal,
+				}),
+				expired,
+			]);
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
+		if (!granted) throw new Error(CONSENT_DECLINED);
+	};
+
+	const gate = async (ctx: ConsentUi, kind: "actions" | "screenshots", title: string, detail: string): Promise<void> => {
+		const enabled = kind === "actions" ? (config.consent?.actions ?? true) : (config.consent?.screenshots ?? false);
+		if (!enabled) return;
+		await requireConsent(ctx, title, detail);
+	};
+
 	const resolveTarget = (params: { host?: string; port?: number }): { host: string; port: number } => {
 		const host = params.host ?? config.host;
 		if (!host) {
@@ -254,7 +315,8 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 			height: Type.Optional(Type.Number({ description: "Requested desktop height (default 1080)" })),
 		}),
 		executionMode: "sequential",
-		async execute(_id, params) {
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			await gate(ctx, "actions", "Allow remote desktop control?", `Pi wants to open an RDP session.`);
 			config = loadConfig();
 			const target = resolveTarget(params);
 			const username = params.username ?? config.username;
@@ -304,7 +366,8 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 			),
 		}),
 		executionMode: "sequential",
-		async execute(_id, params) {
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			await gate(ctx, "screenshots", "Allow a screenshot?", `Pi wants to capture a screenshot of your desktop.`);
 			const result = await bridge.call("screenshot", {
 				max_width: params.max_width ?? config.maxScreenshotWidth,
 				allow_blank: params.allow_blank ?? false,
@@ -329,7 +392,8 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 			clicks: Type.Optional(Type.Number({ description: "Number of clicks, 2 for a double click" })),
 		}),
 		executionMode: "sequential",
-		async execute(_id, params) {
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			await gate(ctx, "actions", "Allow this click?", `Pi wants to click at (${params.x}, ${params.y}).`);
 			const result = await bridge.call("click", {
 				x: params.x,
 				y: params.y,
@@ -349,7 +413,8 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 			y: Type.Number({ description: "Vertical pixel coordinate" }),
 		}),
 		executionMode: "sequential",
-		async execute(_id, params) {
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			await gate(ctx, "actions", "Allow this pointer move?", `Pi wants to move the pointer to (${params.x}, ${params.y}).`);
 			const result = await bridge.call("move", { x: params.x, y: params.y });
 			return { content: [text(`Pointer moved to (${params.x}, ${params.y}).`)], details: result };
 		},
@@ -372,7 +437,8 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 			steps: Type.Optional(Type.Number({ description: "Intermediate movement steps (default 12)" })),
 		}),
 		executionMode: "sequential",
-		async execute(_id, params) {
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			await gate(ctx, "actions", "Allow this drag?", `Pi wants to drag from (${params.x1}, ${params.y1}) to (${params.x2}, ${params.y2}).`);
 			const result = await bridge.call("drag", {
 				x1: params.x1,
 				y1: params.y1,
@@ -403,7 +469,8 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 			y: Type.Optional(Type.Number({ description: "Pointer y for the scroll" })),
 		}),
 		executionMode: "sequential",
-		async execute(_id, params) {
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			await gate(ctx, "actions", "Allow this scroll?", `Pi wants to scroll the desktop.`);
 			const result = await bridge.call("scroll", {
 				direction: params.direction ?? "down",
 				amount: params.amount ?? 3,
@@ -427,7 +494,8 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 			interval: Type.Optional(Type.Number({ description: "Delay between keystrokes in seconds" })),
 		}),
 		executionMode: "sequential",
-		async execute(_id, params) {
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			await gate(ctx, "actions", "Allow typing?", `Pi wants to type ${params.text.length} characters into the focused window.`);
 			const result = await bridge.call("type", { text: params.text, interval: params.interval ?? 0.01 });
 			return {
 				content: [text(`Typed ${params.text.length} characters.`)],
@@ -450,7 +518,8 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 			),
 		}),
 		executionMode: "sequential",
-		async execute(_id, params) {
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			await gate(ctx, "actions", "Allow this keypress?", `Pi wants to press ${params.key}.`);
 			const result = await bridge.call("key", { key: params.key, action: params.action ?? "press" });
 			return { content: [text(`Sent key ${params.key}.`)], details: result };
 		},
