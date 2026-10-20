@@ -1,0 +1,22 @@
+{
+	"name": "pi-rdp-computer-use",
+	"version": "0.1.0",
+	"description": "Computer use over RDP for Pi: headless screenshots and mouse/keyboard control that work on Wayland",
+	"type": "module",
+	"license": "MIT",
+	"keywords": ["pi-package", "pi-extension", "rdp", "computer-use", "wayland", "remote-desktop"],
+	"pi": {
+		"extensions": ["./extensions/rdp.ts"]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"typebox": "*"
+	},
+	"files": ["extensions", "bridge", "README.md", "LICENSE"],
+	"engines": {
+		"node": ">=20"
+	},
+	"scripts": {
+		"smoke": "uv run --quiet --python 3.13 --with aardwolf --with pillow --no-project -- python bridge/rdp_bridge.py"
+	}
+}
