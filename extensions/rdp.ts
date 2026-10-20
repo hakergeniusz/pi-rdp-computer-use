@@ -93,6 +93,8 @@ class Bridge {
 	private pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
 	private stderrLog: string[] = [];
 	private config: RdpConfig;
+	/** Bumped on every restart so a dying child's handlers cannot clobber the new one. */
+	private generation = 0;
 
 	constructor(config: RdpConfig) {
 		this.config = config;
@@ -108,9 +110,16 @@ class Bridge {
 
 	/** Drop the process so the next call re-reads the config (protocol switch). */
 	restart(): void {
-		this.child?.kill();
+		const old = this.child;
 		this.child = undefined;
 		this.buffer = "";
+		this.generation += 1;
+		if (this.pending.size > 0) {
+			const reason = new Error("The desktop bridge was restarted; the request was cancelled.");
+			for (const [, entry] of this.pending) entry.reject(reason);
+			this.pending.clear();
+		}
+		old?.kill();
 	}
 
 	get running(): boolean {
@@ -139,17 +148,23 @@ class Bridge {
 			stdio: ["pipe", "pipe", "pipe"],
 			env: { ...process.env, PYTHONUNBUFFERED: "1" },
 		}) as ChildProcessWithoutNullStreams;
+		const generation = this.generation;
 
 		child.stdout.setEncoding("utf8");
-		child.stdout.on("data", (chunk: string) => this.onStdout(chunk));
+		child.stdout.on("data", (chunk: string) => {
+			if (generation !== this.generation) return;
+			this.onStdout(chunk);
+		});
 		child.stderr.setEncoding("utf8");
 		child.stderr.on("data", (chunk: string) => {
+			if (generation !== this.generation) return;
 			for (const line of chunk.split("\n")) {
 				if (line.trim()) this.stderrLog.push(line.trim());
 			}
 			if (this.stderrLog.length > 200) this.stderrLog = this.stderrLog.slice(-100);
 		});
 		child.on("exit", (code) => {
+			if (generation !== this.generation) return; // a restart replaced this child
 			this.child = undefined;
 			const reason = new Error(
 				`Desktop bridge exited (code ${code ?? "null"}).${this.recentStderr() ? `\n${this.recentStderr()}` : ""}`,
@@ -158,6 +173,7 @@ class Bridge {
 			this.pending.clear();
 		});
 		child.on("error", (error) => {
+			if (generation !== this.generation) return;
 			this.child = undefined;
 			for (const [, entry] of this.pending) entry.reject(new Error(`RDP bridge failed: ${error.message}`));
 			this.pending.clear();
