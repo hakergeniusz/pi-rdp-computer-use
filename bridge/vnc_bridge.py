@@ -577,14 +577,21 @@ def _button_mask(name: str) -> int:
 def _explain(error: Exception) -> str:
     text = str(error)
     hints = []
-    if "authentication failed" in text.lower() or "wrong password" in text.lower():
+    lowered = text.lower()
+    if "authentication failed" in lowered or "wrong password" in lowered:
         hints.append(
             "Verify the VNC password (max 8 characters, set with 'grdctl vnc set-password'), "
             "and that auth-method is set to password rather than prompt."
         )
-    if "connection refused" in text.lower():
+    if "connection refused" in lowered:
         hints.append("No VNC server is listening; enable it with 'grdctl vnc enable'.")
-    if "timed out" in text.lower() or isinstance(error, asyncio.TimeoutError):
+    if "connection reset" in lowered or "connection lost" in lowered or "broken pipe" in lowered:
+        hints.append(
+            "The server accepted the connection and dropped it. gnome-remote-desktop reports this as "
+            "'Session creation inhibited' when a previous session was never closed cleanly; "
+            "restart the daemon with 'systemctl --user restart gnome-remote-desktop.service' or log out and in."
+        )
+    if "timed out" in lowered or isinstance(error, asyncio.TimeoutError):
         hints.append(
             "The server accepted the TCP connection but never sent an RFB banner - "
             "gnome-remote-desktop does this when auth-method is 'prompt'."

@@ -29,6 +29,7 @@ Python bridge (bridge/*.py)  ── RDP (aardwolf) or RFB 3.8 ──▶  desktop
 * **Input** is sent as RDP fastpath input events and RFB pointer/key events, so it works in any layout and needs no local input permissions.
 * **Resilient geometry.** Servers that ignore the requested resolution (GNOME Remote Desktop shares the real screen size) are handled by a tracking canvas, so frames are never cropped or dropped.
 * **Self-healing.** If the bridge or the server drops the session, the next tool call reconnects with the stored credentials.
+* **Clean disconnects.** `rdp_disconnect` ends the bridge's read loop and closes the socket with a FIN, so the server tears the session down properly. Killing the bridge instead leaves a half-open session behind, and gnome-remote-desktop then refuses every new connection.
 
 ## Tools
 
@@ -147,6 +148,7 @@ A prompt that nobody answers within `consent.timeoutMs` (default 3 minutes) coun
 * **VNC connects but the banner never arrives** — the server waits for a desktop dialog:
   `gsettings set org.gnome.desktop.remote-desktop.vnc auth-method password`.
 * **NLA rejects every client** — a known gnome-remote-desktop bug; the VNC transport is the workaround, and `rdp_connect` falls back to it automatically.
+* **"Session creation inhibited"** — the server still holds a session from an earlier client that vanished without a clean disconnect. Restart the daemon with `systemctl --user restart gnome-remote-desktop.service`; if the message persists, log out and back in (the compositor keeps the session state).
 * **The screen looks frozen** — the server only sends what changed; `full_refresh: true` asks for the whole framebuffer.
 
 ## License

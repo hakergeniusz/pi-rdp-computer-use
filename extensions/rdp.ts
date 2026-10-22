@@ -284,9 +284,28 @@ class Bridge {
 	}
 
 	stop(): void {
-		if (!this.child) return;
-		this.child.kill("SIGTERM");
+		const child = this.child;
+		if (!child) return;
 		this.child = undefined;
+		// Close stdin first: the bridge leaves its read loop, closes the socket
+		// and lets the server tear the session down cleanly. Killing it
+		// outright leaves the server with a half-open session, and
+		// gnome-remote-desktop then refuses every new connection with
+		// "Session creation inhibited" until the session ends.
+		try {
+			child.stdin.end();
+		} catch {
+			// The pipe may already be closed.
+		}
+		const timer = setTimeout(() => {
+			try {
+				child.kill("SIGTERM");
+			} catch {
+				// Already gone.
+			}
+		}, 3000);
+		timer.unref?.();
+		child.once("exit", () => clearTimeout(timer));
 	}
 }
 
@@ -342,11 +361,19 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 		try {
 			const all = pi.getAllTools();
 			const active = pi.getActiveTools();
+			const whitelist = pi.getSettings().defaultTools;
+			const missing = TOOL_NAMES.filter((name) => !active.includes(name));
+			if (whitelist && whitelist.length > 0) {
+				// The user pinned the tool set: keep the desktop tools usable
+				// without adding a discovery tool they did not ask for.
+				if (missing.length) pi.setActiveTools([...active, ...missing]);
+				return;
+			}
 			if (all.some((tool) => tool.name === "tool_search")) {
 				if (!active.includes("tool_search")) pi.setActiveTools([...active, "tool_search"]);
-			} else if (!active.some((name) => TOOL_NAMES.includes(name))) {
-				pi.setActiveTools([...active, ...TOOL_NAMES]);
+				return;
 			}
+			if (missing.length) pi.setActiveTools([...active, ...missing]);
 		} catch {
 			// Never let activation bookkeeping break the session.
 		}
@@ -1028,11 +1055,39 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("rdp", {
-		description: "RDP computer use: /rdp status | doctor | shot [path] | region x y w h [path] | disconnect",
+		description:
+			"RDP computer use: /rdp connect [host] | status | doctor | shot [path] | region x y w h [path] | disconnect",
 		handler: async (rawArgs, ctx) => {
 			const [subcommand, ...rest] = rawArgs.trim().split(/\s+/);
 			try {
 				switch (subcommand) {
+					case "connect": {
+						const target = resolveTarget({ host: rest[0] });
+						const password = config.password;
+						if (password === undefined) {
+							throw new Error("No password configured. Set RDP_PASSWORD or the config file.");
+						}
+						const { protocol, port } = await openSession(target, {
+							username: config.username,
+							password,
+							domain: config.domain,
+							width: config.width,
+							height: config.height,
+						});
+						liveConnection = {
+							host: target.host,
+							port,
+							protocol,
+							username: config.username,
+							password,
+							domain: config.domain,
+							width: config.width,
+							height: config.height,
+						};
+						sessionConsent = true;
+						ctx.ui.notify(`Connected to ${target.host}:${port} over ${protocol.toUpperCase()}.`, "info");
+						return;
+					}
 					case "status": {
 						const status = await call("status", {}, 20_000);
 						ctx.ui.notify(JSON.stringify(status), status.connected ? "info" : "warning");
@@ -1076,7 +1131,7 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 					}
 					default:
 						ctx.ui.notify(
-							"Usage: /rdp status | doctor | shot [path] | region x y width height [path] | disconnect",
+							"Usage: /rdp connect [host] | status | doctor | shot [path] | region x y width height [path] | disconnect",
 							"warning",
 						);
 				}
