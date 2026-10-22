@@ -17,14 +17,14 @@ Diagnostics go to stderr, never to stdout, so stdout stays a clean channel.
 from __future__ import annotations
 
 import asyncio
-import base64
-import io
 import json
 import os
 import sys
 import time
 import traceback
 from typing import Any
+
+from imaging import crop_region, draw_cursor, draw_region_box, encode_image
 
 # A canvas larger than any expected remote desktop. The bridge tracks which
 # area the server actually painted, so oversized frames from servers that
@@ -118,6 +118,9 @@ class RdpSession:
         self.info: dict[str, Any] = {}
         self.connected_at: float | None = None
         self.last_error: str | None = None
+        # Last pointer position we sent, in desktop pixels.
+        self.pointer_x: int | None = None
+        self.pointer_y: int | None = None
 
     # -- lifecycle ---------------------------------------------------------
     async def connect(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -237,18 +240,47 @@ class RdpSession:
         image = self.buffer.cropped() if args.get("crop", True) else image
         if image.mode != "RGB":
             image = image.convert("RGB")
-        max_width = int(args.get("max_width") or 0)
-        if max_width and image.width > max_width:
-            ratio = max_width / float(image.width)
-            image = image.resize((max_width, max(1, int(image.height * ratio))))
-        buffer = io.BytesIO()
-        image.save(buffer, format="PNG", optimize=True)
-        payload = buffer.getvalue()
+
+        desktop = {"width": image.width, "height": image.height}
+
+        mark = args.get("mark_region")
+        if mark:
+            draw_region_box(image, {
+                "x": int(mark.get("x", 0)),
+                "y": int(mark.get("y", 0)),
+                "width": int(mark.get("width", 0)),
+                "height": int(mark.get("height", 0)),
+            })
+
+        cropped, region = crop_region(image, args.get("region"))
+
+        cursor_x = args.get("cursor_x")
+        cursor_y = args.get("cursor_y")
+        if cursor_x is None:
+            cursor_x = self.pointer_x
+        if cursor_y is None:
+            cursor_y = self.pointer_y
+        cursor_visible = False
+        if args.get("highlight_cursor", True) and cursor_x is not None and cursor_y is not None:
+            local_x = int(cursor_x) - (region["x"] if region else 0)
+            local_y = int(cursor_y) - (region["y"] if region else 0)
+            if 0 <= local_x < cropped.width and 0 <= local_y < cropped.height:
+                draw_cursor(cropped, local_x, local_y)
+                cursor_visible = True
+
+        encoded = encode_image(
+            cropped,
+            fmt=str(args.get("format") or "png"),
+            quality=int(args.get("quality") or 85),
+            max_width=int(args.get("max_width") or 0),
+            max_height=int(args.get("max_height") or 0),
+        )
+
         return {
-            "png_base64": base64.b64encode(payload).decode("ascii"),
-            "width": image.width,
-            "height": image.height,
-            "bytes": len(payload),
+            **encoded,
+            "desktop": desktop,
+            "region": region,
+            "cursor": {"x": cursor_x, "y": cursor_y, "visible": cursor_visible},
             "frame_ready": self.has_frame(),
         }
 
@@ -263,6 +295,7 @@ class RdpSession:
         clicks = max(1, int(args.get("clicks") or 1))
         delay = float(args.get("interval") or 0.08)
         await _call(conn.send_mouse(MOUSEBUTTON.MOUSEBUTTON_HOVER, x, y, False))
+        self.pointer_x, self.pointer_y = x, y
         for index in range(clicks):
             await _call(conn.send_mouse(button, x, y, True))
             await asyncio.sleep(0.02)
@@ -278,7 +311,25 @@ class RdpSession:
         x = int(args["x"])
         y = int(args["y"])
         await _call(conn.send_mouse(MOUSEBUTTON.MOUSEBUTTON_HOVER, x, y, False))
+        self.pointer_x, self.pointer_y = x, y
         return {"moved_to": {"x": x, "y": y}}
+
+    async def button(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Press or release a mouse button and hold it (for drags)."""
+        conn = self.require()
+        from aardwolf.commons.queuedata.constants import MOUSEBUTTON
+
+        name = str(args.get("button", "left")).lower()
+        action = str(args.get("action", "down")).lower()
+        x = int(args.get("x", self.pointer_x or 0))
+        y = int(args.get("y", self.pointer_y or 0))
+        await _call(conn.send_mouse(MOUSEBUTTON.MOUSEBUTTON_HOVER, x, y, False))
+        self.pointer_x, self.pointer_y = x, y
+        if action in {"down", "press"}:
+            await _call(conn.send_mouse(_button(name), x, y, True))
+        else:
+            await _call(conn.send_mouse(_button(name), x, y, False))
+        return {"button": name, "action": action, "at": [x, y]}
 
     async def drag(self, args: dict[str, Any]) -> dict[str, Any]:
         conn = self.require()
@@ -289,11 +340,13 @@ class RdpSession:
         x2, y2 = int(args["x2"]), int(args["y2"])
         steps = max(1, int(args.get("steps") or 12))
         await _call(conn.send_mouse(MOUSEBUTTON.MOUSEBUTTON_HOVER, x1, y1, False))
+        self.pointer_x, self.pointer_y = x1, y1
         await _call(conn.send_mouse(button, x1, y1, True))
         for step in range(1, steps + 1):
             x = int(x1 + (x2 - x1) * step / steps)
             y = int(y1 + (y2 - y1) * step / steps)
             await _call(conn.send_mouse(MOUSEBUTTON.MOUSEBUTTON_HOVER, x, y, False))
+            self.pointer_x, self.pointer_y = x, y
             await asyncio.sleep(0.02)
         await _call(conn.send_mouse(button, x2, y2, False))
         return {"dragged": {"from": [x1, y1], "to": [x2, y2], "button": args.get("button", "left")}}
@@ -312,6 +365,7 @@ class RdpSession:
         y = int(args.get("y", self.buffer.max_y // 2 if self.buffer else 0))
         amount = max(1, int(args.get("amount") or 3))
         await _call(conn.send_mouse(MOUSEBUTTON.MOUSEBUTTON_HOVER, x, y, False))
+        self.pointer_x, self.pointer_y = x, y
         for _ in range(amount):
             await _call(conn.send_mouse(wheel, x, y, True))
             await _call(conn.send_mouse(wheel, x, y, False))
@@ -395,11 +449,16 @@ class RdpSession:
                 if self.has_frame()
                 else None
             ),
+            "pointer": {"x": self.pointer_x, "y": self.pointer_y},
             "uptime_seconds": (
                 round(time.time() - self.connected_at, 1) if self.connected_at else None
             ),
             "last_error": self.last_error,
         }
+
+    async def clipboard_text(self, args: dict[str, Any]) -> dict[str, Any]:
+        """The RDP transport does not expose the server clipboard here."""
+        return {"text": None, "supported": False, "note": "Clipboard reads are only available over VNC."}
 
     def doctor(self) -> dict[str, Any]:
         """Environment facts useful when a connection is refused."""
@@ -475,6 +534,8 @@ COMMANDS = {
     "scroll": "scroll",
     "type": "type_text",
     "key": "key",
+    "button": "button",
+    "clipboard": "clipboard_text",
 }
 
 
@@ -493,7 +554,7 @@ async def dispatch(session: RdpSession, command: str, args: dict[str, Any]) -> A
             await session.close()
             return {"connected": False}
         method = getattr(session, method_name)
-        if command in {"screenshot", "click", "move", "drag", "scroll", "type", "key"}:
+        if command in {"screenshot", "click", "move", "drag", "scroll", "type", "key", "button", "clipboard"}:
             session.require()
         return await method(args)
 

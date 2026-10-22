@@ -1,6 +1,6 @@
 # pi-rdp-computer-use
 
-Computer use over **RDP or VNC** for [Pi](https://pi.dev): the agent sees a remote desktop as images and drives it with mouse and keyboard events.
+Full desktop control for [Pi](https://pi.dev) over **RDP or VNC**: the agent sees a remote desktop as images and drives it with mouse and keyboard events.
 
 Built for Wayland desktops, where X11 automation tools (`xdotool`), screen grabbers (`scrot`/`import`) and input injectors (`ydotool`, `uinput`) are unavailable or need root. This extension needs none of them: it speaks the remote desktop protocol directly.
 
@@ -25,15 +25,55 @@ Python bridge (bridge/*.py)  ── RDP (aardwolf) or RFB 3.8 ──▶  desktop
 ```
 
 * **No display required.** The bridge never opens a window, so it runs on headless machines and under Wayland alike.
-* **Observation** is the RDP framebuffer, decoded and returned to the model as a PNG.
-* **Input** is sent as RDP fastpath input events (mouse + Unicode/scancode keyboard), so it works in any layout and needs no local input permissions.
+* **Observation** is the remote framebuffer, decoded and returned to the model as a PNG (or JPEG, on request).
+* **Input** is sent as RDP fastpath input events and RFB pointer/key events, so it works in any layout and needs no local input permissions.
 * **Resilient geometry.** Servers that ignore the requested resolution (GNOME Remote Desktop shares the real screen size) are handled by a tracking canvas, so frames are never cropped or dropped.
+* **Self-healing.** If the bridge or the server drops the session, the next tool call reconnects with the stored credentials.
 
-## Requirements
+## Tools
 
-* Pi with extension support
-* `uv` (runs the Python bridge; dependencies are installed on demand)
-* A desktop server that accepts your credentials: RDP (Windows, `xrdp`, GNOME Remote Desktop) or VNC (GNOME Remote Desktop, `x11vnc`, wayvnc, TigerVNC)
+The tools are registered with `deferred` exposure: Pi does not spend context on them until the agent looks for them. `tool_search` finds them by name and description, and the extension activates `tool_search` at session start when it is available.
+
+| Tool | What it does |
+| --- | --- |
+| `rdp_connect` | Open a session (RDP or VNC) and report the desktop size. Falls back to the other transport if the first one fails. |
+| `rdp_screenshot` | Capture the full desktop **or a region** of it, with the mouse cursor highlighted by a magenta crosshair. |
+| `rdp_mouse` | Left, right or middle click at any desktop pixel, move, drag, press/release a held button, or scroll up/down/left/right. |
+| `rdp_keyboard` | Type text (Unicode, layout independent) or press a named key or combination (`enter`, `tab`, `escape`, `f5`, `ctrl+c`, `alt+tab`). |
+| `rdp_disconnect` | Close the session and stop the bridge. |
+| `rdp_status` | Session state, transport, geometry, pointer position, last error. |
+| `rdp_clipboard` | Read the remote clipboard (VNC transport only). |
+
+### Coordinates
+
+Every coordinate is a **desktop pixel**: the origin is the top-left of the whole screen, and the size is the one reported by `rdp_connect` (`1920x1080` for a 1080p display, and larger on a multi-monitor desktop).
+
+A screenshot reports the mapping back to desktop pixels, so the agent never has to guess:
+
+```
+Full desktop 1920x1080.
+Image pixel (ix, iy) = desktop (ix/1, iy/1).
+Mouse cursor at desktop (640, 360), marked with a magenta crosshair.
+```
+
+```
+Region 800x400 of the 1920x1080 desktop, origin at desktop (0, 0).
+Image pixel (ix, iy) = desktop (0 + ix/1, 0 + iy/1). Use those desktop coordinates for rdp_mouse.
+```
+
+If the capture was downscaled (`max_width`, `max_height`), the scale factor is included in the same formula. `rdp_mouse` also accepts `space: "image"`, which interprets the coordinates in the pixel space of the last screenshot instead of the desktop.
+
+### Screenshot options
+
+| Option | Effect |
+| --- | --- |
+| `region` | `{x, y, width, height}` — capture only that part of the screen. |
+| `mark_region` | Outline an area on a full-desktop capture to show where to look. |
+| `highlight_cursor` | Draw the magenta crosshair at the mouse cursor (default on). |
+| `cursor_x`, `cursor_y` | Mark a known cursor position explicitly. |
+| `max_width`, `max_height` | Downscale the image (the scale is reported back). |
+| `format`, `quality` | `png` (default) or `jpeg`. |
+| `full_refresh` | Ask the server for the whole framebuffer instead of only what changed. |
 
 ## Install
 
@@ -62,7 +102,7 @@ Credentials are resolved in this order: tool parameter → environment variable 
 | geometry | – | `width`, `height` |
 | screenshot cap | – | `maxScreenshotWidth` |
 | python | `PI_RDP_PYTHON` | `python` |
-| consent | – | `consent.actions`, `consent.screenshots`, `consent.timeoutMs` |
+| consent | `PI_RDP_CONSENT` | `consent.mode`, `consent.screenshots`, `consent.timeoutMs` |
 
 Config file: `~/.config/pi-rdp-computer-use/config.json`
 
@@ -71,160 +111,43 @@ Config file: `~/.config/pi-rdp-computer-use/config.json`
   "protocol": "vnc",
   "host": "127.0.0.1",
   "port": 5900,
-  "password": "••••••••",
-  "consent": { "actions": true, "timeoutMs": 180000 }
+  "password": "secret12",
+  "consent": { "mode": "session", "timeoutMs": 180000 }
 }
 ```
 
 Prefer `RDP_PASSWORD` or a `chmod 600` config file over passing passwords in tool arguments: passwords appear in session transcripts. The extension never logs the password and strips it from tool details.
 
-To avoid the on-demand `uv` install, point `PI_RDP_PYTHON` at an interpreter that already has `aardwolf` and `pillow`:
+### Consent
+
+`consent.mode` decides how often the agent has to ask before touching the desktop:
+
+| Mode | Behaviour |
+| --- | --- |
+| `session` (default) | One confirmation when the session is opened, then free rein for that session. |
+| `action` | A confirmation before every click, drag, scroll and keystroke. |
+| `off` | Never ask. |
+
+A prompt that nobody answers within `consent.timeoutMs` (default 3 minutes) counts as a refusal, so a forgotten dialog can never turn into unattended remote control. The legacy `consent.actions` boolean is still honoured: `false` means `off`, `true` means `action`.
+
+## Command line
 
 ```bash
-uv venv ~/.local/share/pi-rdp
-uv pip install --python ~/.local/share/pi-rdp/bin/python aardwolf pillow
-export PI_RDP_PYTHON=~/.local/share/pi-rdp/bin/python
-```
-
-## VNC backend (GNOME Remote Desktop)
-
-GNOME Remote Desktop's VNC backend is the reliable path on Wayland: it shares the
-live session, and its password authentication has none of the NLA machinery that
-RDP uses. Three settings decide whether it works at all:
-
-```bash
-# 1. password auth instead of the default desktop prompt
-#    (with "prompt" the server sends no RFB banner and every client just times out)
-gsettings set org.gnome.desktop.remote-desktop.vnc auth-method password
-
-# 2. allow input, not just viewing (the default is view-only)
-gsettings set org.gnome.desktop.remote-desktop.vnc view-only false
-
-# 3. an 8-character password (RFB truncates to 8) and enable the backend
-grdctl vnc set-password 'Secret12'
-grdctl vnc enable
-systemctl --user restart gnome-remote-desktop.service
-```
-
-Then point the extension at it:
-
-```json
-{ "protocol": "vnc", "host": "127.0.0.1", "port": 5900, "password": "Secret12" }
-```
-
-Notes:
-
-* The VNC backend shares the **live, unlocked** session. If the screen is locked the agent sees the lock screen; it cannot unlock it.
-* Screen contents can change under the agent while you work — expect frames to differ from what it saw a moment earlier.
-* Disable it again with `grdctl vnc disable` and `gsettings set org.gnome.desktop.remote-desktop.vnc enable false`.
-
-## Consent
-
-Every tool that changes your desktop asks first, and the prompt **auto-declines after 3 minutes** of no answer — a forgotten dialog can never turn into unattended remote control.
-
-| Tool | Asks by default |
-| --- | --- |
-| `rdp_connect`, `rdp_click`, `rdp_move`, `rdp_drag`, `rdp_scroll`, `rdp_type`, `rdp_key` | yes |
-| `rdp_screenshot`, `rdp_status`, `rdp_disconnect` | no (read-only) |
-
-On a decline or a timeout the tool sends nothing and returns `The user did not grant consent (declined or no answer within 3 minutes)` so the model knows control was withheld.
-
-```json
-{
-  "consent": {
-    "actions": true,
-    "screenshots": false,
-    "timeoutMs": 180000
-  }
-}
-```
-
-Set `consent.actions` to `false` only if you want the model to drive the desktop without prompts. Screenshots are not gated by default because they are non-destructive; set `consent.screenshots` to `true` to be asked before each capture.
-
-## Tools
-
-| Tool | Purpose |
-| --- | --- |
-| `rdp_connect` | Open a session, wait for the first frame |
-| `rdp_screenshot` | Capture the desktop as an image |
-| `rdp_click` | Click at `x`,`y` (`button`, `clicks`) |
-| `rdp_move` | Hover the pointer at `x`,`y` |
-| `rdp_drag` | Drag from `x1`,`y1` to `x2`,`y2` |
-| `rdp_scroll` | Wheel `up`/`down` at a position |
-| `rdp_type` | Type text via Unicode key events |
-| `rdp_key` | Named keys and chords: `enter`, `f5`, `ctrl+c`, `alt+tab` |
-| `rdp_status` | Connection state, geometry, uptime, last error |
-| `rdp_disconnect` | Close the session |
-
-Slash command: `/rdp status | doctor | shot [path] | disconnect`
-
-A typical agent loop:
-
-```
-rdp_connect(host="192.168.1.20", username="me")
-rdp_screenshot()                      # look at the screen
-rdp_click(x=412, y=230)               # open a menu
-rdp_screenshot()                      # verify the result
-rdp_type(text="hello world")
-rdp_key(key="ctrl+s")
+/rdp status                      # session state
+/rdp doctor                      # environment facts
+/rdp shot [path]                 # save a full screenshot
+/rdp region x y w h [path]       # save a region screenshot
+/rdp disconnect                  # close the session
 ```
 
 ## Troubleshooting
 
-Run `/rdp doctor` first: it reports the Python and library versions, the protocol in use, the negotiated encodings, and whether any local display is involved (never).
-
-**`STATUS_LOGON_FAILURE` (0xc000006d) or `SEC_E_LOGON_DENIED`**
-The server refused the credentials during NLA/CredSSP. Check the username and password first. If you run GNOME Remote Desktop, re-set the RDP credentials and restart the daemon:
-
-```bash
-grdctl rdp set-credentials <username> '<password>'   # positional, not via stdin
-systemctl --user restart gnome-remote-desktop.service
-```
-
-Note that `grdctl rdp set-credentials <user> --password` with piped stdin can store a mangled value; the daemon then keeps rejecting a password that looks correct.
-
-**Input is ignored though screenshots update**
-The server is in view-only mode. For RDP:
-
-```bash
-grdctl rdp disable-view-only
-```
-
-For VNC the same concept lives in dconf, and it is **on by default**:
-
-```bash
-gsettings set org.gnome.desktop.remote-desktop.vnc view-only false
-```
-
-**VNC: the connection hangs with no banner at all**
-`auth-method` is still `prompt`, so the server waits for someone to approve a dialog on the desktop before speaking RFB. Set `auth-method password` (see [VNC backend](#vnc-backend-gnome-remote-desktop)).
-
-**VNC: `VNC authentication failed`**
-RFB only uses the first 8 characters of the password, and `grdctl vnc set-password` stores exactly what you give it. Keep client and server strings identical in those 8 characters, then restart the daemon.
-
-**VNC: screen stops updating**
-The bridge only negotiates RAW and CopyRect. If a server insists on another encoding it raises `unsupported encoding` in `/rdp status` (`last_error`); reconnect. aardwolf's own VNC client is not used because its RRE path raises, its pointer masks never set a button, and its wheel maps to button 0.
-
-**Server requires NLA**
-Already handled: the bridge offers NTLM inside CredSSP. Kerberos-first clients (`xfreerdp3`) can fail on hosts whose `/etc/krb5.conf` has a default realm, which is why this bridge pins NTLM.
-
-**Screenshot is blank right after connect**
-The server has not painted yet. `rdp_screenshot` waits for the first frame (set `allow_blank` to skip that wait, or lower `first_frame_timeout`).
-
-**Slow first call**
-The first tool call pays for `uv`'s resolve/install of the bridge dependencies (`aardwolf`+`pillow` for RDP, `pillow`+`pycryptodomex` for VNC). Set `PI_RDP_PYTHON` to a prepared virtualenv to remove that.
-
-**The agent's keystrokes land in whatever is focused on the real desktop**
-That is the point of computer use, but it also means a stray `escape` or `ctrl+w` hits your own windows (including the terminal running Pi). Keep the consent prompt enabled and only approve actions you want on that screen.
-
-## Security
-
-* Every input tool is consent-gated with a 3-minute auto-decline (see [Consent](#consent)).
-* The session runs with your user's privileges and a live remote-control channel to the target desktop.
-* Nothing is written to disk except screenshots you request through `/rdp shot`.
-* The bridge talks only to the configured host and port; there is no telemetry.
-* Treat the desktop password like any other secret: prefer the environment variable or a `chmod 600` config, and rotate it if it has been shared in plain text.
-* VNC password authentication is DES-based, limited to 8 characters, and sends the challenge/response **without TLS**. Only enable the VNC backend on a host/network you trust; for RDP the bridge keeps NLA (with TLS inside CredSSP).
+* **RDP connects but every click is ignored** — the server is in view-only mode:
+  `grdctl rdp disable-view-only` (and `gsettings set org.gnome.desktop.remote-desktop.vnc view-only false` for VNC).
+* **VNC connects but the banner never arrives** — the server waits for a desktop dialog:
+  `gsettings set org.gnome.desktop.remote-desktop.vnc auth-method password`.
+* **NLA rejects every client** — a known gnome-remote-desktop bug; the VNC transport is the workaround, and `rdp_connect` falls back to it automatically.
+* **The screen looks frozen** — the server only sends what changed; `full_refresh: true` asks for the whole framebuffer.
 
 ## License
 

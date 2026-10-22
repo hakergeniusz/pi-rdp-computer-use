@@ -17,8 +17,6 @@ Protocol: one JSON object per line on stdin, one per line on stdout.
 from __future__ import annotations
 
 import asyncio
-import base64
-import io
 import json
 import struct
 import sys
@@ -27,6 +25,8 @@ import traceback
 from typing import Any
 
 from PIL import Image
+
+from imaging import crop_region, draw_cursor, draw_region_box, encode_image
 
 SERVER_VERSION = "RFB 003.008"
 
@@ -114,6 +114,12 @@ class VncSession:
         self.frame_seq = 0
         self.rects_seen = 0
         self.encoding_error: str | None = None
+        # Last pointer position we sent, in desktop pixels. Used to mark the
+        # cursor in screenshots, because RFB never reports the pointer back.
+        self.pointer_x: int | None = None
+        self.pointer_y: int | None = None
+        # Last clipboard text the server pushed (ServerCutText).
+        self.clipboard: str | None = None
 
     # -- lifecycle ---------------------------------------------------------
     async def connect(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -157,9 +163,11 @@ class VncSession:
 
     async def _handshake(self, password: str) -> None:
         assert self.reader is not None and self.writer is not None
-        self.version = (await self.reader.readexactly(12)).decode("latin-1").strip()
+        # Send our version first: servers either greet immediately or wait for
+        # the client's version, and this order works with both.
         self.writer.write(SERVER_VERSION.encode("ascii") + b"\n")
         await self.writer.drain()
+        self.version = (await self.reader.readexactly(12)).decode("latin-1").strip()
 
         count = (await self.reader.readexactly(1))[0]
         if count == 0:
@@ -182,6 +190,12 @@ class VncSession:
         elif 1 in types:  # no authentication
             self.writer.write(bytes([1]))
             await self.writer.drain()
+            # RFB 3.8 sends a SecurityResult even for the "None" security type.
+            status = struct.unpack("!I", await self.reader.readexactly(4))[0]
+            if status != 0:
+                size = struct.unpack("!I", await self.reader.readexactly(4))[0]
+                reason = (await self.reader.readexactly(size)).decode("latin-1", "replace")
+                raise ConnectionError(f"Server refused the connection: {reason}")
         else:
             raise ConnectionError(
                 f"Server offers unsupported security types {types}; "
@@ -284,7 +298,8 @@ class VncSession:
                 elif message == MSG_SERVER_CUT_TEXT:
                     await self.reader.readexactly(3)
                     size = struct.unpack("!I", await self.reader.readexactly(4))[0]
-                    await self.reader.readexactly(size)
+                    raw = await self.reader.readexactly(size)
+                    self.clipboard = raw.decode("latin-1", "replace")
                 else:
                     raise RuntimeError(f"Unexpected server message type {message}")
         except asyncio.CancelledError:
@@ -320,30 +335,65 @@ class VncSession:
     async def screenshot(self, args: dict[str, Any]) -> dict[str, Any]:
         self.require()
         assert self.canvas is not None
+        timeout = float(args.get("timeout") or 6)
         if args.get("refresh", True):
             before = self.frame_seq
-            await self.request_update(full=True)
-            await self.wait_for_frame(float(args.get("timeout") or 6), after=before)
+            # Incremental requests carry only the changed rectangles; a full
+            # refresh is 30+ MB on a 4K desktop, so it is opt-in.
+            await self.request_update(full=bool(args.get("full_refresh")))
+            await self.wait_for_frame(timeout, after=before)
             await self.settle()
+
+        desktop = {"width": self.canvas.width, "height": self.canvas.height}
         image = self.canvas.copy()
-        max_width = int(args.get("max_width") or 0)
-        if max_width and image.width > max_width:
-            ratio = max_width / float(image.width)
-            image = image.resize((max_width, max(1, int(image.height * ratio))))
-        buffer = io.BytesIO()
-        image.save(buffer, format="PNG", optimize=True)
-        payload = buffer.getvalue()
+
+        mark = args.get("mark_region")
+        if mark:
+            draw_region_box(image, {
+                "x": int(mark.get("x", 0)),
+                "y": int(mark.get("y", 0)),
+                "width": int(mark.get("width", 0)),
+                "height": int(mark.get("height", 0)),
+            })
+
+        cropped, region = crop_region(image, args.get("region"))
+
+        cursor_x = args.get("cursor_x")
+        cursor_y = args.get("cursor_y")
+        if cursor_x is None:
+            cursor_x = self.pointer_x
+        if cursor_y is None:
+            cursor_y = self.pointer_y
+        cursor_visible = False
+        if args.get("highlight_cursor", True) and cursor_x is not None and cursor_y is not None:
+            # The marker lives in desktop space; shift it into region space.
+            local_x = int(cursor_x) - (region["x"] if region else 0)
+            local_y = int(cursor_y) - (region["y"] if region else 0)
+            if 0 <= local_x < cropped.width and 0 <= local_y < cropped.height:
+                draw_cursor(cropped, local_x, local_y)
+                cursor_visible = True
+
+        encoded = encode_image(
+            cropped,
+            fmt=str(args.get("format") or "png"),
+            quality=int(args.get("quality") or 85),
+            max_width=int(args.get("max_width") or 0),
+            max_height=int(args.get("max_height") or 0),
+        )
+
         return {
-            "png_base64": base64.b64encode(payload).decode("ascii"),
-            "width": image.width,
-            "height": image.height,
-            "bytes": len(payload),
+            **encoded,
+            "desktop": desktop,
+            "region": region,
+            "cursor": {"x": cursor_x, "y": cursor_y, "visible": cursor_visible},
+            "frames": self.frame_seq,
             "frame_ready": True,
         }
 
     # -- input -------------------------------------------------------------
     async def _pointer(self, mask: int, x: int, y: int) -> None:
         await self._send(struct.pack("!BBHH", 5, mask, int(x), int(y)))
+        self.pointer_x, self.pointer_y = int(x), int(y)
 
     async def click(self, args: dict[str, Any]) -> dict[str, Any]:
         self.require()
@@ -366,6 +416,18 @@ class VncSession:
         await self._pointer(0, x, y)
         return {"moved_to": {"x": x, "y": y}}
 
+    async def button(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Press or release a mouse button and hold it (for drags)."""
+        self.require()
+        name = str(args.get("button", "left")).lower()
+        action = str(args.get("action", "down")).lower()
+        mask = _button_mask(name)
+        x = int(args.get("x", self.pointer_x or 0))
+        y = int(args.get("y", self.pointer_y or 0))
+        await self._pointer(0, x, y)
+        await self._pointer(mask if action in {"down", "press"} else 0, x, y)
+        return {"button": name, "action": action, "at": [x, y]}
+
     async def drag(self, args: dict[str, Any]) -> dict[str, Any]:
         self.require()
         mask = _button_mask(args.get("button", "left"))
@@ -383,9 +445,12 @@ class VncSession:
     async def scroll(self, args: dict[str, Any]) -> dict[str, Any]:
         self.require()
         direction = str(args.get("direction", "down")).lower()
-        mask = 8 if direction in {"up", "in"} else 16  # RFB buttons 4 (up) and 5 (down)
-        x = int(args.get("x", self.width // 2))
-        y = int(args.get("y", self.height // 2))
+        masks = {"up": 8, "down": 16, "left": 32, "right": 64, "in": 8, "out": 16}
+        if direction not in masks:
+            raise ValueError(f"Unknown scroll direction: {direction!r}")
+        mask = masks[direction]
+        x = int(args.get("x", self.pointer_x if self.pointer_x is not None else self.width // 2))
+        y = int(args.get("y", self.pointer_y if self.pointer_y is not None else self.height // 2))
         amount = max(1, int(args.get("amount") or 3))
         await self._pointer(0, x, y)
         for _ in range(amount):
@@ -461,9 +526,15 @@ class VncSession:
             "frame_ready": self.canvas is not None,
             "frames": self.frame_seq,
             "rects": self.rects_seen,
+            "pointer": {"x": self.pointer_x, "y": self.pointer_y},
+            "clipboard_length": len(self.clipboard) if self.clipboard else 0,
             "uptime_seconds": round(time.time() - self.connected_at, 1) if self.connected_at else None,
             "last_error": self.last_error,
         }
+
+    async def clipboard_text(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Return the last clipboard text the server pushed to us."""
+        return {"text": self.clipboard, "length": len(self.clipboard or "")}
 
     def doctor(self) -> dict[str, Any]:
         try:
@@ -532,6 +603,8 @@ COMMANDS = {
     "scroll": "scroll",
     "type": "type_text",
     "key": "key",
+    "button": "button",
+    "clipboard": "clipboard_text",
 }
 
 
@@ -549,7 +622,7 @@ async def dispatch(session: VncSession, command: str, args: dict[str, Any]) -> A
         if command == "disconnect":
             await session.close()
             return {"connected": False}
-        if command in {"screenshot", "click", "move", "drag", "scroll", "type", "key"}:
+        if command in {"screenshot", "click", "move", "drag", "scroll", "type", "key", "button", "clipboard"}:
             session.require()
         return await getattr(session, method_name)(args)
 
