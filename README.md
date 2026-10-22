@@ -41,6 +41,7 @@ The tools are registered with `deferred` exposure: Pi does not spend context on 
 | `rdp_screenshot` | Capture the full desktop **or a region** of it, with the mouse cursor highlighted by a magenta crosshair. |
 | `rdp_mouse` | Left, right or middle click at any desktop pixel, move, drag, press/release a held button, or scroll up/down/left/right. |
 | `rdp_keyboard` | Type text (Unicode, layout independent) or press a named key or combination (`enter`, `tab`, `escape`, `f5`, `ctrl+c`, `alt+tab`). |
+| `rdp_wait` | Wait until the screen changes, instead of sleeping blindly. |
 | `rdp_disconnect` | Close the session and stop the bridge. |
 | `rdp_status` | Session state, transport, geometry, pointer position, last error. |
 | `rdp_clipboard` | Read the remote clipboard (VNC transport only). |
@@ -74,7 +75,23 @@ If the capture was downscaled (`max_width`, `max_height`), the scale factor is i
 | `cursor_x`, `cursor_y` | Mark a known cursor position explicitly. |
 | `max_width`, `max_height` | Downscale the image (the scale is reported back). |
 | `format`, `quality` | `png` (default) or `jpeg`. |
+| `ocr`, `ocr_lang` | Also return the text on screen, read with tesseract (`eng` by default). |
 | `full_refresh` | Ask the server for the whole framebuffer instead of only what changed. |
+
+### OCR
+
+With `ocr: true` the capture is also read by tesseract and the text comes back with the image:
+
+```
+Text on screen (OCR):
+Files   Home   Recent   Starred
+```
+
+A vision model reads the image anyway, but exact text (a version number, an error
+message, a file name) is far more reliable when it is spelled out. The capture
+is never cropped for OCR: a region uses a single block of text, a full screen
+uses sparse text. Tesseract runs on the machine that runs Pi, not on the remote
+desktop, so it works for any transport.
 
 ## Install
 

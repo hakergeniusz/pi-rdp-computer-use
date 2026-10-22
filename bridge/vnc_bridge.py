@@ -26,7 +26,7 @@ from typing import Any
 
 from PIL import Image
 
-from imaging import crop_region, draw_cursor, draw_region_box, encode_image
+from imaging import crop_region, draw_cursor, draw_region_box, encode_image, ocr_text as run_ocr
 
 SERVER_VERSION = "RFB 003.008"
 
@@ -381,6 +381,14 @@ class VncSession:
             max_height=int(args.get("max_height") or 0),
         )
 
+        text = None
+        ocr_error = None
+        if args.get("ocr"):
+            # A region is one block of text (psm 6), a full screen is sparse (psm 11).
+            text, ocr_error = await run_ocr(
+                cropped, lang=str(args.get("ocr_lang") or "eng"), psm=6 if region else 11
+            )
+
         return {
             **encoded,
             "desktop": desktop,
@@ -388,6 +396,8 @@ class VncSession:
             "cursor": {"x": cursor_x, "y": cursor_y, "visible": cursor_visible},
             "frames": self.frame_seq,
             "frame_ready": True,
+            "ocr_text": text,
+            "ocr_error": ocr_error,
         }
 
     # -- input -------------------------------------------------------------
@@ -517,6 +527,20 @@ class VncSession:
                 await asyncio.sleep(0.01)
         return {"key": spec, "modifiers": parts[:-1]}
 
+    async def wait_for_change(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Wait until the server sends a new frame, i.e. the screen changed."""
+        self.require()
+        timeout = float(args.get("timeout") or 10)
+        before = self.frame_seq
+        started = time.monotonic()
+        await self.request_update(full=False)
+        changed = await self.wait_for_frame(timeout, after=before)
+        return {
+            "changed": changed,
+            "waited_ms": int((time.monotonic() - started) * 1000),
+            "frames": self.frame_seq,
+        }
+
     # -- status ------------------------------------------------------------
     async def status(self) -> dict[str, Any]:
         return {
@@ -612,6 +636,7 @@ COMMANDS = {
     "key": "key",
     "button": "button",
     "clipboard": "clipboard_text",
+    "wait": "wait_for_change",
 }
 
 
@@ -629,7 +654,7 @@ async def dispatch(session: VncSession, command: str, args: dict[str, Any]) -> A
         if command == "disconnect":
             await session.close()
             return {"connected": False}
-        if command in {"screenshot", "click", "move", "drag", "scroll", "type", "key", "button", "clipboard"}:
+        if command in {"screenshot", "click", "move", "drag", "scroll", "type", "key", "button", "clipboard", "wait"}:
             session.require()
         return await getattr(session, method_name)(args)
 

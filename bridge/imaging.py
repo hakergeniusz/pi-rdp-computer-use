@@ -9,8 +9,12 @@ no matter which one is in use.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
+import os
+import shutil
+import tempfile
 from typing import Any
 
 from PIL import Image, ImageDraw
@@ -154,3 +158,44 @@ def encode_image(
         "height": target_height,
         "scale": round(scale, 6),
     }
+
+
+async def ocr_text(
+    image: Image.Image, lang: str = "eng", psm: int | None = None
+) -> tuple[str | None, str | None]:
+    """Extract the text of `image` with tesseract.
+
+    Returns (text, error). The text is None when tesseract is not installed or
+    the run failed; the error then says why. A model that can read the text
+    itself is still fine, so OCR is an addition, never a requirement.
+    """
+    executable = shutil.which("tesseract")
+    if not executable:
+        return None, "tesseract is not installed on this machine"
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:
+        path = handle.name
+    try:
+        image.convert("RGB").save(path, format="PNG")
+        process = await asyncio.create_subprocess_exec(
+            executable,
+            path,
+            "stdout",
+            "--psm",
+            str(psm if psm is not None else 6),
+            "-l",
+            lang,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=45)
+        return stdout.decode("utf-8", "replace").strip(), None
+    except asyncio.TimeoutError:
+        return None, "tesseract timed out"
+    except OSError as error:
+        return None, f"tesseract failed: {error}"
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass

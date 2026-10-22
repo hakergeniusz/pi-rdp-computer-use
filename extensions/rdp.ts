@@ -55,6 +55,7 @@ const TOOL_NAMES = [
 	"rdp_screenshot",
 	"rdp_mouse",
 	"rdp_keyboard",
+	"rdp_wait",
 	"rdp_disconnect",
 	"rdp_status",
 	"rdp_clipboard",
@@ -491,25 +492,33 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 					: protocol === "vnc"
 						? 5900
 						: 3389;
-			try {
-				config.protocol = protocol;
-				bridge.restart();
-				const result = await bridge.call(
-					"connect",
-					{
-						host: target.host,
-						port,
-						username: credentials.username ?? "",
-						password: credentials.password ?? "",
-						domain: credentials.domain,
-						width: credentials.width,
-						height: credentials.height,
-					},
-					CONNECT_TIMEOUT_MS,
-				);
-				return { result, protocol, port };
-			} catch (error) {
-				lastError = error;
+			for (let attempt = 1; attempt <= 3; attempt += 1) {
+				try {
+					config.protocol = protocol;
+					bridge.restart();
+					const result = await bridge.call(
+						"connect",
+						{
+							host: target.host,
+							port,
+							username: credentials.username ?? "",
+							password: credentials.password ?? "",
+							domain: credentials.domain,
+							width: credentials.width,
+							height: credentials.height,
+						},
+						CONNECT_TIMEOUT_MS,
+					);
+					return { result, protocol, port };
+				} catch (error) {
+					lastError = error;
+					const message = error instanceof Error ? error.message : String(error);
+					// The server may still be tearing down the previous session
+					// ("Session creation inhibited"): wait and try again.
+					const transient = /reset|inhibited|connection lost|refused|timed out/i.test(message);
+					if (!transient || attempt === 3) break;
+					await new Promise((resolve) => setTimeout(resolve, 4000 * attempt));
+				}
 			}
 		}
 		throw lastError instanceof Error ? lastError : new Error(String(lastError));
@@ -558,8 +567,14 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 		const region = (result.region as Region | null) ?? null;
 		const scale = Number(result.scale ?? 1) || 1;
 		const cursor = result.cursor as { x: number | null; y: number | null; visible: boolean } | undefined;
+		const ocr = result.ocr_text as string | null | undefined;
 
 		const lines: string[] = [];
+		if (ocr) {
+			lines.push(`Text on screen (OCR):\n${ocr}`);
+		} else if (result.ocr_error) {
+			lines.push(`OCR unavailable: ${result.ocr_error}`);
+		}
 		if (region) {
 			lines.push(
 				`Region ${region.width}x${region.height} of the ${desktop?.width}x${desktop?.height} desktop, origin at desktop (${region.x}, ${region.y}).`,
@@ -759,6 +774,10 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 				Type.Union([Type.Literal("png"), Type.Literal("jpeg")], { description: "Image format (default png)" }),
 			),
 			quality: Type.Optional(Type.Number({ description: "JPEG quality, 20-95 (default 85)" })),
+			ocr: Type.Optional(
+				Type.Boolean({ description: "Also return the text on screen, read with tesseract" }),
+			),
+			ocr_lang: Type.Optional(Type.String({ description: "tesseract language, e.g. 'eng' (default)" })),
 			full_refresh: Type.Optional(
 				Type.Boolean({ description: "Ask the server for the whole framebuffer instead of only what changed" }),
 			),
@@ -779,6 +798,8 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 				max_height: params.max_height,
 				format: params.format ?? "png",
 				quality: params.quality ?? 85,
+				ocr: params.ocr ?? false,
+				ocr_lang: params.ocr_lang ?? "eng",
 				full_refresh: params.full_refresh ?? false,
 				timeout: params.timeout ?? 6,
 			});
@@ -990,6 +1011,51 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 			}
 
 			return { content: [text(`${parts.join(", ")}.`)], details: result };
+		},
+	});
+
+	pi.registerTool({
+		name: "rdp_wait",
+		label: "Desktop Wait",
+		description:
+			"Wait until the remote screen changes, or until the timeout expires. Use it after an action that should " +
+			"trigger a UI update instead of sleeping blindly, so the agent continues as soon as the screen updates.",
+		promptSnippet: "Wait until the remote screen changes",
+		parameters: Type.Object({
+			timeout: Type.Optional(Type.Number({ description: "Seconds to wait at most (default 10)" })),
+			region: Type.Optional(
+				Type.Object(
+					{
+						x: Type.Number({ description: "Left edge in desktop pixels" }),
+						y: Type.Number({ description: "Top edge in desktop pixels" }),
+						width: Type.Number({ description: "Width in desktop pixels" }),
+						height: Type.Number({ description: "Height in desktop pixels" }),
+					},
+					{ description: "Only watch this part of the screen" },
+				),
+			),
+		}),
+		exposure: "deferred",
+		namespace: NAMESPACE,
+		executionMode: "sequential",
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			await gate(ctx, "screenshots", "Allow watching the screen?", "Pi wants to wait for the screen to change.");
+			const result = await call(
+				"wait",
+				{ timeout: params.timeout ?? 10, region: params.region },
+				Math.round((params.timeout ?? 10) * 1000) + 15_000,
+			);
+			const changed = Boolean(result.changed);
+			return {
+				content: [
+					text(
+						changed
+							? `The screen changed after ${result.waited_ms} ms.`
+							: `The screen did not change within ${params.timeout ?? 10} s.`,
+					),
+				],
+				details: result,
+			};
 		},
 	});
 

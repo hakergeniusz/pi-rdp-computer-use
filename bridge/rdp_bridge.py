@@ -24,7 +24,7 @@ import time
 import traceback
 from typing import Any
 
-from imaging import crop_region, draw_cursor, draw_region_box, encode_image
+from imaging import crop_region, draw_cursor, draw_region_box, encode_image, ocr_text as run_ocr
 
 # A canvas larger than any expected remote desktop. The bridge tracks which
 # area the server actually painted, so oversized frames from servers that
@@ -276,12 +276,58 @@ class RdpSession:
             max_height=int(args.get("max_height") or 0),
         )
 
+        text = None
+        ocr_error = None
+        if args.get("ocr"):
+            text, ocr_error = await run_ocr(
+                cropped, lang=str(args.get("ocr_lang") or "eng"), psm=6 if region else 11
+            )
+
         return {
             **encoded,
             "desktop": desktop,
             "region": region,
             "cursor": {"x": cursor_x, "y": cursor_y, "visible": cursor_visible},
             "frame_ready": self.has_frame(),
+            "ocr_text": text,
+            "ocr_error": ocr_error,
+        }
+
+    async def wait_for_change(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Wait until the framebuffer content changes."""
+        self.require()
+        import hashlib
+
+        timeout = float(args.get("timeout") or 10)
+        region = args.get("region")
+        started = time.monotonic()
+
+        def fingerprint() -> str:
+            assert self.buffer is not None
+            image = self.buffer.cropped()
+            if region:
+                image = image.crop(
+                    (
+                        int(region.get("x", 0)),
+                        int(region.get("y", 0)),
+                        min(image.width, int(region.get("x", 0)) + int(region.get("width", 0))),
+                        min(image.height, int(region.get("y", 0)) + int(region.get("height", 0))),
+                    )
+                )
+            # A small thumbnail is enough to notice a change and keeps this cheap.
+            digest = hashlib.sha1(image.convert("RGB").resize((160, 90)).tobytes()).hexdigest()
+            return digest
+
+        before = fingerprint()
+        changed = False
+        while time.monotonic() - started < timeout:
+            await asyncio.sleep(0.25)
+            if fingerprint() != before:
+                changed = True
+                break
+        return {
+            "changed": changed,
+            "waited_ms": int((time.monotonic() - started) * 1000),
         }
 
     # -- input -------------------------------------------------------------
@@ -536,6 +582,7 @@ COMMANDS = {
     "key": "key",
     "button": "button",
     "clipboard": "clipboard_text",
+    "wait": "wait_for_change",
 }
 
 
@@ -554,7 +601,7 @@ async def dispatch(session: RdpSession, command: str, args: dict[str, Any]) -> A
             await session.close()
             return {"connected": False}
         method = getattr(session, method_name)
-        if command in {"screenshot", "click", "move", "drag", "scroll", "type", "key", "button", "clipboard"}:
+        if command in {"screenshot", "click", "move", "drag", "scroll", "type", "key", "button", "clipboard", "wait"}:
             session.require()
         return await method(args)
 
