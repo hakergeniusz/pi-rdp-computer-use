@@ -197,17 +197,27 @@ class Bridge {
 		const generation = this.generation;
 
 		child.stdout.setEncoding("utf8");
+		child.stdout.on("error", () => {}); // the exit handler cleans up pending calls
 		child.stdout.on("data", (chunk: string) => {
 			if (generation !== this.generation) return;
 			this.onStdout(chunk);
 		});
 		child.stderr.setEncoding("utf8");
+		child.stderr.on("error", () => {});
 		child.stderr.on("data", (chunk: string) => {
 			if (generation !== this.generation) return;
 			for (const line of chunk.split("\n")) {
 				if (line.trim()) this.stderrLog.push(line.trim());
 			}
 			if (this.stderrLog.length > 200) this.stderrLog = this.stderrLog.slice(-100);
+		});
+		// A dead child rejects writes with EPIPE; without a handler Node raises
+		// it as an unhandled 'error' event and the host process goes down.
+		child.stdin.on("error", (error) => {
+			if (generation !== this.generation) return;
+			const reason = new Error(`Desktop bridge pipe failed: ${error.message}`);
+			for (const [, entry] of this.pending) entry.reject(reason);
+			this.pending.clear();
 		});
 		child.on("exit", (code) => {
 			if (generation !== this.generation) return; // a restart replaced this child
@@ -553,7 +563,9 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 			return await bridge.call<T>(cmd, args, timeoutMs);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			const lost = /not connected|no desktop session|bridge exited|bridge failed/i.test(message);
+			const lost = /not connected|no desktop session|connection lost|bridge exited|bridge failed|pipe failed/i.test(
+				message,
+			);
 			if (!lost || !liveConnection) throw error;
 			await ensureSession();
 			return bridge.call<T>(cmd, args, timeoutMs);
@@ -674,11 +686,15 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 			Object.assign(config, loadConfig());
 			const target = resolveTarget(params);
 			const username = params.username ?? config.username;
-			const password = params.password ?? config.password;
-			if (password === undefined) {
-				throw new Error("Missing desktop password (parameter, RDP_PASSWORD, or the config file).");
-			}
+			let password = params.password ?? config.password;
 			const requested = params.protocol as Protocol | undefined;
+			if (password === undefined) {
+				// VNC servers may run without authentication (security type
+				// "None"); RDP always needs credentials.
+				const effective: Protocol = requested ?? (config.protocol === "vnc" ? "vnc" : "rdp");
+				if (effective === "vnc") password = "";
+				else throw new Error("Missing desktop password (parameter, RDP_PASSWORD, or the config file).");
+			}
 
 			await gate(
 				ctx,
@@ -779,8 +795,11 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 			),
 			ocr_lang: Type.Optional(Type.String({ description: "tesseract language, e.g. 'eng' (default)" })),
 			full_refresh: Type.Optional(
-				Type.Boolean({ description: "Ask the server for the whole framebuffer instead of only what changed" }),
-			),
+					Type.Boolean({
+						description:
+							"Ask the VNC server for the whole framebuffer instead of only what changed (ignored on RDP)",
+					}),
+				),
 			timeout: Type.Optional(Type.Number({ description: "Seconds to wait for a fresh frame (default 6)" })),
 		}),
 		exposure: "deferred",
@@ -843,10 +862,10 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 			),
 			clicks: Type.Optional(Type.Number({ description: "Number of clicks, 2 for a double click" })),
 			direction: Type.Optional(
-				Type.Union([Type.Literal("up"), Type.Literal("down"), Type.Literal("left"), Type.Literal("right")], {
-					description: "Scroll direction (default down)",
-				}),
-			),
+					Type.Union([Type.Literal("up"), Type.Literal("down"), Type.Literal("left"), Type.Literal("right")], {
+						description: "Scroll direction (default down). left/right need the VNC transport",
+					}),
+				),
 			amount: Type.Optional(Type.Number({ description: "Scroll ticks (default 3)" })),
 			x1: Type.Optional(Type.Number({ description: "Drag start x in desktop pixels" })),
 			y1: Type.Optional(Type.Number({ description: "Drag start y in desktop pixels" })),
@@ -874,13 +893,18 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 
 			let result: Record<string, unknown> = {};
 			let message = "";
+			let clamped = false;
 
 			if (action === "scroll") {
 				const direction = params.direction ?? "down";
 				const amount = params.amount ?? 3;
+				if ((direction === "left" || direction === "right") && bridge.protocol === "rdp") {
+					throw new Error("Horizontal scrolling needs the VNC transport; over RDP the wheel is vertical only.");
+				}
 				// Without an explicit position the bridge scrolls at the current pointer location.
 				const at =
 					params.x !== undefined && params.y !== undefined ? toDesktop(params.x, params.y, space) : null;
+				clamped = at?.clamped ?? false;
 				result = await call("scroll", {
 					direction,
 					amount,
@@ -895,6 +919,7 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 				}
 				const from = toDesktop(params.x1, params.y1, space);
 				const to = toDesktop(params.x2, params.y2, space);
+				clamped = from.clamped || to.clamped;
 				result = await call("drag", {
 					x1: from.x,
 					y1: from.y,
@@ -909,6 +934,7 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 					throw new Error("A move needs x and y.");
 				}
 				const at = toDesktop(params.x, params.y, space);
+				clamped = at.clamped;
 				result = await call("move", { x: at.x, y: at.y });
 				message = `Moved the pointer to (${at.x}, ${at.y}).`;
 			} else if (action === "down" || action === "up") {
@@ -916,6 +942,7 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 					throw new Error(`${action} needs x and y.`);
 				}
 				const at = toDesktop(params.x, params.y, space);
+				clamped = at.clamped;
 				result = await call("button", { x: at.x, y: at.y, button, action });
 				message = `${action === "down" ? "Pressed" : "Released"} the ${button} button at (${at.x}, ${at.y}).`;
 			} else {
@@ -923,6 +950,7 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 					throw new Error("A click needs x and y.");
 				}
 				const at = toDesktop(params.x, params.y, space);
+				clamped = at.clamped;
 				result = await call("click", {
 					x: at.x,
 					y: at.y,
@@ -930,6 +958,9 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 					clicks: params.clicks ?? 1,
 				});
 				message = `Clicked the ${button} button ${params.clicks ?? 1} time(s) at (${at.x}, ${at.y}).`;
+			}
+			if (clamped) {
+				message += " The requested coordinates were outside the desktop; they were clamped to its bounds.";
 			}
 
 			if (params.capture_after) {
@@ -1069,6 +1100,9 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 		namespace: NAMESPACE,
 		executionMode: "sequential",
 		async execute() {
+			if (!liveConnection && !bridge.running) {
+				return { content: [text("No desktop session was open.")], details: { connected: false } };
+			}
 			let result: Record<string, unknown> = { connected: false };
 			try {
 				result = await call("disconnect", {}, 30_000);
@@ -1094,6 +1128,22 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 		namespace: NAMESPACE,
 		executionMode: "sequential",
 		async execute() {
+			if (!bridge.running) {
+				// Do not spawn a bridge just to be told there is no session.
+				const result = {
+					connected: false,
+					protocol: bridge.protocol,
+					session: liveConnection
+						? {
+								host: liveConnection.host,
+								port: liveConnection.port,
+								protocol: liveConnection.protocol,
+								note: "The bridge is not running; the next tool call reconnects with the stored credentials.",
+							}
+						: { note: "No session yet. Call rdp_connect." },
+				};
+				return { content: [text(JSON.stringify(result, null, 2))], details: result };
+			}
 			const result = await call("status", {}, 20_000);
 			return { content: [text(JSON.stringify(result, null, 2))], details: result };
 		},
@@ -1103,19 +1153,34 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 		name: "rdp_clipboard",
 		label: "Desktop Clipboard",
 		description:
-			"Read the remote clipboard. Only the VNC transport receives clipboard updates from the server, so this " +
-			"usually returns nothing on RDP.",
-		promptSnippet: "Read the remote clipboard",
-		parameters: Type.Object({}),
+			"Read the remote clipboard, or set it by passing text (VNC transport only). Setting the clipboard and then " +
+			"pressing ctrl+v is far faster and more reliable than typing long text with rdp_keyboard. Reading requires " +
+			"the VNC transport too: only it receives clipboard updates from the server.",
+		promptSnippet: "Read or set the remote clipboard",
+		parameters: Type.Object({
+			text: Type.Optional(
+				Type.String({ description: "Set the remote clipboard to this text instead of reading it (VNC only)" }),
+			),
+		}),
 		exposure: "deferred",
 		namespace: NAMESPACE,
 		executionMode: "sequential",
-		async execute() {
-			const result = await call("clipboard", {}, 20_000);
+		async execute(_id, params) {
+			if (params.text !== undefined && bridge.protocol === "rdp") {
+				throw new Error("Setting the clipboard requires the VNC transport (ClientCutText) — it is not available over RDP.");
+			}
+			const result = await call("clipboard", params.text === undefined ? {} : { text: params.text }, 20_000);
+			if (params.text !== undefined) {
+				const length = Number(result.length ?? params.text.length);
+				return {
+					content: [text(`Set the remote clipboard to ${length} characters. Paste it in a remote window with rdp_keyboard key "ctrl+v".`)],
+					details: { set: true, length },
+				};
+			}
 			const value = (result.text as string) ?? "";
 			return {
 				content: [text(value || "The remote clipboard is empty or not available on this transport.")],
-				details: { length: value.length },
+				details: { set: false, length: value.length },
 			};
 		},
 	});
@@ -1129,7 +1194,8 @@ export default function rdpComputerUse(pi: ExtensionAPI) {
 				switch (subcommand) {
 					case "connect": {
 						const target = resolveTarget({ host: rest[0] });
-						const password = config.password;
+						const password =
+							config.password ?? (config.protocol === "vnc" ? "" : undefined);
 						if (password === undefined) {
 							throw new Error("No password configured. Set RDP_PASSWORD or the config file.");
 						}

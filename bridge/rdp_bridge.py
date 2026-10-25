@@ -58,6 +58,22 @@ MODIFIERS: dict[str, str] = {
     "alt": "alt", "super": "super", "win": "super",
 }
 
+# PC set 1 scancodes for printable ASCII. Servers resolve Unicode key events
+# without a modifier context, so `ctrl+c` and friends must be sent as real
+# scancodes to register at all.
+ASCII_SCANCODES: dict[str, int] = {
+    **{letter: code for letter, code in zip(
+        "abcdefghijklmnopqrstuvwxyz",
+        [0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24,
+         0x25, 0x26, 0x32, 0x31, 0x18, 0x19, 0x10, 0x13, 0x1F, 0x14,
+         0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C],
+    )},
+    **{digit: code for digit, code in zip("1234567890", range(0x02, 0x0C))},
+    " ": 0x39, "-": 0x0C, "=": 0x0D, "[": 0x1A, "]": 0x1B,
+    ";": 0x27, "'": 0x28, "`": 0x29, ",": 0x33, ".": 0x34, "/": 0x35,
+    "\\": 0x2B,
+}
+
 
 class TrackingBuffer:
     """Stands in for aardwolf's fixed-size PIL buffer.
@@ -402,11 +418,17 @@ class RdpSession:
         from aardwolf.commons.queuedata.constants import MOUSEBUTTON
 
         direction = str(args.get("direction", "down")).lower()
-        wheel = (
-            MOUSEBUTTON.MOUSEBUTTON_WHEEL_UP
-            if direction in {"up", "in"}
-            else MOUSEBUTTON.MOUSEBUTTON_WHEEL_DOWN
-        )
+        if direction in {"up", "in"}:
+            wheel = MOUSEBUTTON.MOUSEBUTTON_WHEEL_UP
+        elif direction in {"down", "out"}:
+            wheel = MOUSEBUTTON.MOUSEBUTTON_WHEEL_DOWN
+        elif direction in {"left", "right"}:
+            raise ValueError(
+                "Horizontal scrolling is not available over RDP (the wheel is vertical only); "
+                "the VNC transport supports left/right."
+            )
+        else:
+            raise ValueError(f"Unknown scroll direction: {direction!r}")
         x = int(args.get("x", self.buffer.max_x // 2 if self.buffer else 0))
         y = int(args.get("y", self.buffer.max_y // 2 if self.buffer else 0))
         amount = max(1, int(args.get("amount") or 3))
@@ -424,7 +446,7 @@ class RdpSession:
         interval = float(args.get("interval") or 0.01)
         for char in text:
             code = ord(char)
-            if char == "\n":
+            if char in "\n\r":
                 await self._press_scancode("enter")
                 continue
             if char == "\t":
@@ -451,17 +473,15 @@ class RdpSession:
         modifiers = [MODIFIERS.get(part.lower(), part.lower()) for part in parts[:-1]]
         target = parts[-1].lower()
 
+        scancode: int | None = None
+        extended = False
         if target in SCANCODES:
             scancode, extended = SCANCODES[target]
-        elif len(target) == 1:
-            # Single character: send as a Unicode key event.
-            code = ord(target)
-            if action in {"down", "press"}:
-                await _call(conn.send_key_char(code, True))
-            if action in {"up", "press"}:
-                await _call(conn.send_key_char(code, False))
-            return {"key": spec}
-        else:
+        elif len(target) == 1 and modifiers and target in ASCII_SCANCODES:
+            # With modifiers held, the target must be a scancode: servers do
+            # not combine scancode modifiers with Unicode key events.
+            scancode = ASCII_SCANCODES[target]
+        if scancode is None and len(target) != 1:
             raise ValueError(f"Unknown key: {spec!r}")
 
         pressed: list[str] = []
@@ -473,10 +493,19 @@ class RdpSession:
                 await _call(conn.send_key_scancode(mcode, True, mex))
                 pressed.append(modifier)
                 await asyncio.sleep(0.01)
-            if action in {"down", "press"}:
-                await _call(conn.send_key_scancode(scancode, True, extended))
-            if action in {"up", "press"}:
-                await _call(conn.send_key_scancode(scancode, False, extended))
+            if scancode is not None:
+                if action in {"down", "press"}:
+                    await _call(conn.send_key_scancode(scancode, True, extended))
+                if action in {"up", "press"}:
+                    await _call(conn.send_key_scancode(scancode, False, extended))
+            else:
+                # Single character without a scancode: a Unicode key event
+                # works in any layout (best effort under modifiers).
+                code = ord(target)
+                if action in {"down", "press"}:
+                    await _call(conn.send_key_char(code, True))
+                if action in {"up", "press"}:
+                    await _call(conn.send_key_char(code, False))
         finally:
             for modifier in reversed(pressed):
                 mcode, mex = SCANCODES[modifier]
@@ -488,6 +517,7 @@ class RdpSession:
     async def status(self) -> dict[str, Any]:
         return {
             "connected": self.conn is not None,
+            "protocol": "rdp",
             **self.info,
             "frame_ready": self.has_frame(),
             "desktop": (
@@ -503,7 +533,12 @@ class RdpSession:
         }
 
     async def clipboard_text(self, args: dict[str, Any]) -> dict[str, Any]:
-        """The RDP transport does not expose the server clipboard here."""
+        """The RDP transport does not sync the clipboard in this bridge."""
+        if args.get("text") is not None:
+            raise RuntimeError(
+                "Setting the clipboard requires the VNC transport (ClientCutText); "
+                "the RDP bridge runs without the clipboard channel."
+            )
         return {"text": None, "supported": False, "note": "Clipboard reads are only available over VNC."}
 
     def doctor(self) -> dict[str, Any]:

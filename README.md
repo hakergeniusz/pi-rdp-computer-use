@@ -27,8 +27,8 @@ Python bridge (bridge/*.py)  ── RDP (aardwolf) or RFB 3.8 ──▶  desktop
 * **No display required.** The bridge never opens a window, so it runs on headless machines and under Wayland alike.
 * **Observation** is the remote framebuffer, decoded and returned to the model as a PNG (or JPEG, on request).
 * **Input** is sent as RDP fastpath input events and RFB pointer/key events, so it works in any layout and needs no local input permissions.
-* **Resilient geometry.** Servers that ignore the requested resolution (GNOME Remote Desktop shares the real screen size) are handled by a tracking canvas, so frames are never cropped or dropped.
-* **Self-healing.** If the bridge or the server drops the session, the next tool call reconnects with the stored credentials.
+* **Resilient geometry.** Servers that ignore the requested resolution (GNOME Remote Desktop shares the real screen size) are handled by a tracking canvas, so frames are never cropped or dropped. The VNC bridge also follows mid-session resolution changes (DesktopSize pseudo-encoding) and grows its canvas if a server paints outside the announced bounds.
+* **Self-healing.** If the bridge or the server drops the session — including a VNC read loop that dies while the socket stays open, which used to look like a frozen screen — the next tool call reconnects with the stored credentials.
 * **Clean disconnects.** `rdp_disconnect` ends the bridge's read loop and closes the socket with a FIN, so the server tears the session down properly. Killing the bridge instead leaves a half-open session behind, and gnome-remote-desktop then refuses every new connection.
 
 ## Tools
@@ -39,12 +39,12 @@ The tools are registered with `deferred` exposure: Pi does not spend context on 
 | --- | --- |
 | `rdp_connect` | Open a session (RDP or VNC) and report the desktop size. Falls back to the other transport if the first one fails. |
 | `rdp_screenshot` | Capture the full desktop **or a region** of it, with the mouse cursor highlighted by a magenta crosshair. |
-| `rdp_mouse` | Left, right or middle click at any desktop pixel, move, drag, press/release a held button, or scroll up/down/left/right. |
+| `rdp_mouse` | Left, right or middle click at any desktop pixel, move, drag, press/release a held button, or scroll up/down (left/right on VNC only). |
 | `rdp_keyboard` | Type text (Unicode, layout independent) or press a named key or combination (`enter`, `tab`, `escape`, `f5`, `ctrl+c`, `alt+tab`). |
 | `rdp_wait` | Wait until the screen changes, instead of sleeping blindly. |
 | `rdp_disconnect` | Close the session and stop the bridge. |
 | `rdp_status` | Session state, transport, geometry, pointer position, last error. |
-| `rdp_clipboard` | Read the remote clipboard (VNC transport only). |
+| `rdp_clipboard` | Read the remote clipboard, or set it with `text` (VNC transport only). |
 
 ### Coordinates
 
@@ -76,7 +76,7 @@ If the capture was downscaled (`max_width`, `max_height`), the scale factor is i
 | `max_width`, `max_height` | Downscale the image (the scale is reported back). |
 | `format`, `quality` | `png` (default) or `jpeg`. |
 | `ocr`, `ocr_lang` | Also return the text on screen, read with tesseract (`eng` by default). |
-| `full_refresh` | Ask the server for the whole framebuffer instead of only what changed. |
+| `full_refresh` | Ask the VNC server for the whole framebuffer instead of only what changed (RDP streams only changed areas regardless). |
 
 ### OCR
 
@@ -92,6 +92,16 @@ message, a file name) is far more reliable when it is spelled out. The capture
 is never cropped for OCR: a region uses a single block of text, a full screen
 uses sparse text. Tesseract runs on the machine that runs Pi, not on the remote
 desktop, so it works for any transport.
+
+### Clipboard (VNC)
+
+Over VNC the clipboard works in both directions: `rdp_clipboard` with `text`
+sets the remote clipboard (ClientCutText), without it the last text the server
+pushed is returned. The fastest way to enter long text is to set the clipboard
+and then press `ctrl+v` with `rdp_keyboard` — far quicker and more reliable than
+typing it. `rdp_keyboard` sends named keys and `ctrl`/`alt`/`shift`/`super`
+combinations as real scancodes, so shortcuts like `ctrl+c` or `alt+tab` behave
+on both transports.
 
 ## Install
 
@@ -134,7 +144,7 @@ Config file: `~/.config/pi-rdp-computer-use/config.json`
 }
 ```
 
-Prefer `RDP_PASSWORD` or a `chmod 600` config file over passing passwords in tool arguments: passwords appear in session transcripts. The extension never logs the password and strips it from tool details.
+Prefer `RDP_PASSWORD` or a `chmod 600` config file over passing passwords in tool arguments: passwords appear in session transcripts. The extension never logs the password and strips it from tool details. A VNC server running without authentication (security type "None") needs no password when the configured protocol is `vnc`; RDP always requires one.
 
 ### Consent
 

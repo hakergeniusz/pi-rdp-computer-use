@@ -32,6 +32,8 @@ SERVER_VERSION = "RFB 003.008"
 
 ENC_RAW = 0
 ENC_COPY_RECT = 1
+#: Pseudo-encoding: the rectangle carries the new framebuffer size, not pixels.
+ENC_DESKTOP_SIZE = -223
 
 MSG_FRAMEBUFFER_UPDATE = 0
 MSG_SET_COLOUR_MAP = 1
@@ -141,6 +143,7 @@ class VncSession:
             raise ConnectionError(_explain(error)) from error
 
         self.connected_at = time.time()
+        self.last_error = None
         self.task = asyncio.create_task(self._read_loop())
         self.info = {"host": host, "port": port, "protocol": "vnc", "server_name": self.server_name}
 
@@ -216,7 +219,9 @@ class VncSession:
         await self._send(b"\x00\x00\x00\x00" + struct.pack("!BBBBHHHBBB3x", 32, 24, 0, 1, 255, 255, 255, 0, 8, 16))
         self.bypp = 4
         self.canvas = Image.new("RGB", (self.width, self.height), (0, 0, 0))
-        await self._set_encodings([ENC_RAW, ENC_COPY_RECT])
+        # DesktopSize is announced so the server tells us about resolution
+        # changes instead of streaming rects the canvas cannot hold.
+        await self._set_encodings([ENC_RAW, ENC_COPY_RECT, ENC_DESKTOP_SIZE])
 
     async def _send(self, payload: bytes) -> None:
         assert self.writer is not None
@@ -278,6 +283,11 @@ class VncSession:
                 pass
 
     def require(self) -> None:
+        if self.last_error is not None:
+            # The reader died (server hung up or sent garbage). Commands would
+            # either hang or paint a frozen canvas, so fail loudly instead;
+            # the extension reconnects on this error.
+            raise RuntimeError(f"Connection lost: {self.last_error}")
         if self.writer is None or self.canvas is None:
             raise RuntimeError("Not connected. Call rdp_connect first.")
 
@@ -308,6 +318,22 @@ class VncSession:
             self.last_error = f"framebuffer reader stopped: {error}"
             print(f"[bridge] {self.last_error}", file=sys.stderr)
 
+    def _ensure_canvas_fits(self, x: int, y: int, width: int, height: int) -> None:
+        """Grow the canvas when a rect lands outside it.
+
+        Servers that change resolution without a DesktopSize pseudo-rect would
+        otherwise have PIL silently clip (read: drop) every update outside the
+        old bounds, and the screen freezes without an error anywhere.
+        """
+        assert self.canvas is not None
+        need_w, need_h = x + width, y + height
+        if need_w <= self.canvas.width and need_h <= self.canvas.height:
+            return
+        grown = Image.new("RGB", (max(need_w, self.canvas.width), max(need_h, self.canvas.height)), (0, 0, 0))
+        grown.paste(self.canvas, (0, 0))
+        self.canvas = grown
+        self.width, self.height = self.canvas.width, self.canvas.height
+
     async def _handle_update(self) -> None:
         assert self.reader is not None and self.canvas is not None
         await self.reader.readexactly(1)
@@ -316,12 +342,22 @@ class VncSession:
             x, y, width, height, encoding = struct.unpack("!HHHHi", await self.reader.readexactly(12))
             if encoding == ENC_RAW:
                 payload = await self.reader.readexactly(width * height * self.bypp)
-                tile = Image.frombytes("RGB", (width, height), payload, "raw", "BGRX")
+                self._ensure_canvas_fits(x, y, width, height)
+                # The negotiated format is 32bpp true colour with r/g/b shifts
+                # 0/8/16, little endian, so the wire order is r,g,b,x.
+                tile = Image.frombytes("RGB", (width, height), payload, "raw", "RGBX")
                 self.canvas.paste(tile, (x, y))
             elif encoding == ENC_COPY_RECT:
                 src_x, src_y = struct.unpack("!HH", await self.reader.readexactly(4))
+                self._ensure_canvas_fits(x, y, width, height)
                 patch = self.canvas.crop((src_x, src_y, src_x + width, src_y + height))
                 self.canvas.paste(patch, (x, y))
+            elif encoding == ENC_DESKTOP_SIZE:
+                # x, y are 0 and width/height are the new framebuffer size.
+                resized = Image.new("RGB", (width, height), (0, 0, 0))
+                resized.paste(self.canvas, (0, 0))
+                self.canvas = resized
+                self.width, self.height = width, height
             else:
                 self.encoding_error = (
                     f"server sent unsupported encoding {encoding}; "
@@ -478,7 +514,7 @@ class VncSession:
         text = str(args["text"])
         interval = float(args.get("interval") or 0.01)
         for char in text:
-            if char == "\n":
+            if char in "\n\r":
                 await self._tap(KEYSYMS["enter"])
             elif char == "\t":
                 await self._tap(KEYSYMS["tab"])
@@ -528,13 +564,41 @@ class VncSession:
         return {"key": spec, "modifiers": parts[:-1]}
 
     async def wait_for_change(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Wait until the server sends a new frame, i.e. the screen changed."""
+        """Wait until the screen changes: any new frame, or a new fingerprint
+        of just the watched region."""
         self.require()
         timeout = float(args.get("timeout") or 10)
-        before = self.frame_seq
+        region = args.get("region")
         started = time.monotonic()
         await self.request_update(full=False)
-        changed = await self.wait_for_frame(timeout, after=before)
+
+        if not region:
+            before = self.frame_seq - 1  # request_update is in flight; count it
+            changed = await self.wait_for_frame(timeout, after=before)
+            return {
+                "changed": changed,
+                "waited_ms": int((time.monotonic() - started) * 1000),
+                "frames": self.frame_seq,
+            }
+
+        import hashlib
+
+        def fingerprint() -> str:
+            assert self.canvas is not None
+            x = max(0, int(region.get("x", 0)))
+            y = max(0, int(region.get("y", 0)))
+            right = min(self.canvas.width, x + int(region.get("width", 0)))
+            bottom = min(self.canvas.height, y + int(region.get("height", 0)))
+            crop = self.canvas.crop((x, y, max(x + 1, right), max(y + 1, bottom)))
+            return hashlib.sha1(crop.convert("RGB").tobytes()).hexdigest()
+
+        before = fingerprint()
+        changed = False
+        while time.monotonic() - started < timeout:
+            await asyncio.sleep(0.1)
+            if fingerprint() != before:
+                changed = True
+                break
         return {
             "changed": changed,
             "waited_ms": int((time.monotonic() - started) * 1000),
@@ -557,7 +621,15 @@ class VncSession:
         }
 
     async def clipboard_text(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Return the last clipboard text the server pushed to us."""
+        """Set the server clipboard (ClientCutText) or return the last pushed text."""
+        self.require()
+        text = args.get("text")
+        if text is not None:
+            # Modern servers (gnome-remote-desktop, wayvnc) read cut text as
+            # UTF-8; it is identical to Latin-1 for the ASCII they all accept.
+            payload = str(text).encode("utf-8")
+            await self._send(struct.pack("!BxxxI", 6, len(payload)) + payload)
+            return {"set": True, "length": len(payload)}
         return {"text": self.clipboard, "length": len(self.clipboard or "")}
 
     def doctor(self) -> dict[str, Any]:
@@ -578,7 +650,7 @@ class VncSession:
             "python": sys.version.split()[0],
             "pillow": pillow_ok,
             "pycryptodomex": pycryptodome_ok,
-            "encodings": ["raw", "copyrect"],
+            "encodings": ["raw", "copyrect", "desktopsize"],
             "display_needed": False,
             "notes": [
                 "The bridge speaks RFB 3.8 directly; no X11, Wayland screencast or uinput access is required.",
